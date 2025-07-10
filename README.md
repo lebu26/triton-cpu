@@ -39,6 +39,7 @@ export LLVM_LIBRARY_DIR=$LLVM_BUILD_DIR/lib
 export LLVM_SYSPATH=$LLVM_BUILD_DIR
 export PATH=$LLVM_BUILD_DIR/bin:$PATH
 export TRITON_BUILD_WITH_CLANG_LLD=true
+export TRITON_PLUGIN_DIRS=$(pwd)/triton-shared
 pip install -e python
 ```
 
