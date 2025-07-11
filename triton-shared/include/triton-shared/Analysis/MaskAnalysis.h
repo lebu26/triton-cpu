@@ -12,7 +12,9 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 
+#include "mlir/Support/LogicalResult.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "llvm/Support/LogicalResult.h"
 
 #include <utility>
 
@@ -47,6 +49,11 @@ struct MaskState {
   OpFoldResult end;
   SmallVector<OpFoldResult> dims;
   OpFoldResult scalar;
+  const bool useUnsafeMask;
+
+  void dump() const;
+
+  MaskState(bool useUnsafeMask = false) : useUnsafeMask(useUnsafeMask) {}
 
   int64_t getRank() const { return dims.size(); }
 
@@ -58,9 +65,8 @@ struct MaskState {
   // defining operation and Value type
   LogicalResult parse(Value operand, const Location loc, OpBuilder &builder);
 
-  tensor::ExtractSliceOp
-  getExtractSlice(Value source, const Location loc,
-                  OpBuilder &builder) const;
+  tensor::ExtractSliceOp getExtractSlice(Value source, const Location loc,
+                                         OpBuilder &builder) const;
 
   memref::SubViewOp getSubview(Value source, const Location loc,
                                OpBuilder &builder) const;
@@ -90,6 +96,9 @@ private:
   // Helper functions to parse values to populate MaskState
   // -------
 
+  LogicalResult parseExtSI(arith::ExtSIOp op, const Location loc,
+                           OpBuilder &builder);
+
   // Operand is the result of a constant
   // Get the value of the constant and assign it to scalar.
   LogicalResult parseConstant(arith::ConstantOp constOp, const Location loc,
@@ -111,9 +120,17 @@ private:
                          OpBuilder &builder);
 
   // Operand is the result of cmpi
-  // Assume only of the dimensions have size > 1. Only support slt for now.
-  // For that dimension, calculate this new dim as: dim = min(end, value) -
-  // start
+  // Assume only one of the dimensions has size > 1. Only support slt/ult, and
+  // sge against 0 for now. For that dimension, we have three cases:
+  //  1. Constant comparison with both left and right-hand sides being scalars.
+  //     Calculate this new dim as a compare and select.
+  //      I.e. dim = lhs < rhs ? end : 0
+  //  2. Left-hand side is not a scalar, and the right-hand side is.
+  //      2.a. Predicate is slt/ult. Calculate this new dim as:
+  //            dim = max(min(end, value), start) - start
+  //      2.b. Predicate is sge against 0. Mask analysis already has an
+  //            assumption that the mask starts at 0, so evaluate this to true
+  //            and calculate this new dim as: dim = end
   LogicalResult parseCmp(arith::CmpIOp cmpOp, const Location loc,
                          OpBuilder &builder);
   // Operand is the result of make_range
@@ -134,6 +151,9 @@ private:
   // dimension that contains the range.
   LogicalResult parseExpandDims(triton::ExpandDimsOp expandDimsOp,
                                 const Location loc, OpBuilder &builder);
+
+  LogicalResult parseLoopIterArg(Value v, const Location loc,
+                                 OpBuilder &builder);
 };
 
 } // namespace triton

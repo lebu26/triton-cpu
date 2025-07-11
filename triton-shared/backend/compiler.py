@@ -43,7 +43,7 @@ def _ttir_to_ttsharedir(mod):
         Path(src_path).write_text(ttir_code)
         _dump_ir_if_needed([src_path])
         triton_shared_opt_path = _get_triton_shared_opt_path()
-        subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "--mlir-print-debuginfo", "-o", dst_path])
+        subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg", "--mlir-print-debuginfo", "-o", dst_path])
         return Path(dst_path).read_text()
 
 
@@ -129,6 +129,7 @@ class CPUOptions:
     debug: bool = False
     arch: str = None
     num_warps: int = 0
+    num_threads: int = 1
     num_ctas: int = 0
     num_stages: int = 1
     enable_warp_specialization: bool = False
@@ -166,7 +167,7 @@ class CPUBackend(BaseBackend):
         args.update({k: opts[k] for k in CPUOptions.__dataclass_fields__.keys() if k in opts})
         return CPUOptions(**args)
 
-    def get_codegen_implementation(self, options):
+    def get_codegen_implementation(self):
         codegen_fns = {"min_dot_size": lambda lhsType, rhsType: (1, 1, 1)}
         return codegen_fns
 
@@ -194,20 +195,16 @@ class CPUBackend(BaseBackend):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)
-        passes.ttir.add_rewrite_tensor_pointer(pm)
-        passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
-        passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
+        passes.common.add_canonicalizer(pm)
         passes.ttir.add_reorder_broadcast(pm)
         passes.common.add_cse(pm)
-        passes.ttir.add_triton_licm(pm)
+        passes.common.add_licm(pm)
         passes.common.add_symbol_dce(pm)
-        passes.ttir.add_loop_unroll(pm)
-        passes.common.add_cse(pm)
         pm.run(mod)
         return mod
 
-    def add_stages(self, stages, options, language):
+    def add_stages(self, stages, options):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
         stages["ttsharedir"] = lambda src, metadata: _optimize_ttsharedir(_ttir_to_ttsharedir(src))
         stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_llir(src))

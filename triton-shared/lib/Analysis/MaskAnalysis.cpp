@@ -6,11 +6,21 @@
 //===----------------------------------------------------------------------===//
 
 #include "triton-shared/Analysis/MaskAnalysis.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Support/LogicalResult.h"
+
 #include "triton-shared/Analysis/OpFoldResultUtils.h"
 
+#include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "mlir/Transforms/DialectConversion.h"
+
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/LogicalResult.h"
+#include <cassert>
 
 namespace mlir {
 
@@ -36,6 +46,10 @@ LogicalResult MaskState::parse(Value operand, const Location loc,
     return this->parseSplat(op, loc, builder);
   } else if (auto op = operand.getDefiningOp<triton::ExpandDimsOp>()) {
     return this->parseExpandDims(op, loc, builder);
+  } else if (!operand.getDefiningOp()) {
+    return this->parseLoopIterArg(operand, loc, builder);
+  } else if (auto op = operand.getDefiningOp<arith::ExtSIOp>()) {
+    return this->parseExtSI(op, loc, builder);
   } else {
     return failure();
   }
@@ -105,8 +119,8 @@ static memref::SubViewOp createSubview(Value src, Location loc, OpBuilder &b,
 // +               +      |
 // +++++++++++++++++-------
 //
-// If we simply take the subview of `buffer_tmp`, this requires an extra buffer
-// to just hold the temporary result.
+// If we simply take the subview of `buffer_tmp`, this requires an extra
+// buffer to just hold the temporary result.
 //
 // So we can subview into block1 and block2 directly. There are 2 cases:
 //   + subview only spans block1
@@ -127,8 +141,8 @@ static memref::SubViewOp createSubview(Value src, Location loc, OpBuilder &b,
 // Let (row, col1) and (row, col2) be the dimensions of block1 and block2,
 // respectively.
 //
-// Let (rowFull, colFull), (rowView1, colView1) and (rowView2, colView2) be the
-// dimensions of the full subview, sv1, and sv2, respectively.
+// Let (rowFull, colFull), (rowView1, colView1) and (rowView2, colView2) be
+// the dimensions of the full subview, sv1, and sv2, respectively.
 //
 // + colView1 = min(colFull, col1)
 // + colView2 = colFull - colView1
@@ -251,6 +265,17 @@ LogicalResult MaskState::parseIntScalar(Value scalar, const Location loc,
   return success();
 }
 
+void MaskState::dump() const {
+  llvm::dbgs() << "start: " << start << "\n";
+  llvm::dbgs() << "end: " << end << "\n";
+  llvm::dbgs() << "scalar: " << scalar << "\n";
+  llvm::dbgs() << "useUnsafeMask: " << useUnsafeMask << "\n";
+  llvm::dbgs() << "dims: ";
+  for (auto dim : dims)
+    llvm::dbgs() << "\t" << dim << "\n";
+  llvm::dbgs() << "\n";
+}
+
 LogicalResult MaskState::parseAdd(arith::AddIOp addOp, const Location loc,
                                   OpBuilder &builder) {
   assert(this->isEmpty());
@@ -283,12 +308,20 @@ LogicalResult MaskState::parseAnd(arith::AndIOp andOp, const Location loc,
   return this->minStates(lhsState, rhsState, loc, builder);
 }
 
+LogicalResult MaskState::parseExtSI(arith::ExtSIOp op, const Location loc,
+                                    OpBuilder &builder) {
+  assert(this->isEmpty());
+  return parse(op.getIn(), loc, builder);
+}
+
 LogicalResult MaskState::parseCmp(arith::CmpIOp cmpOp, const Location loc,
                                   OpBuilder &builder) {
   assert(this->isEmpty());
 
-  if (cmpOp.getPredicate() != arith::CmpIPredicate::slt) {
-    InFlightDiagnostic diag = emitError(loc) << "Unsupported cmpi predicate";
+  if (cmpOp.getPredicate() != arith::CmpIPredicate::slt &&
+      cmpOp.getPredicate() != arith::CmpIPredicate::ult &&
+      cmpOp.getPredicate() != arith::CmpIPredicate::sge) {
+    InFlightDiagnostic diag = emitError(loc) << "Unsupported cmpi";
     return failure();
   }
 
@@ -300,9 +333,17 @@ LogicalResult MaskState::parseCmp(arith::CmpIOp cmpOp, const Location loc,
   if (failed(rhsState.parse(cmpOp.getRhs(), loc, builder)))
     return failure();
 
-  assert((!lhsState.scalar && rhsState.scalar) && "Unsupported cmpi scenario");
+  // We only support sge against 0 for lower bounds. Dims already has an
+  // implicit assumption that the lower bound is 0, so if we see this, assume
+  // the comparison evaluates to true.
+  if (cmpOp.getPredicate() == arith::CmpIPredicate::sge
+    && !(rhsState.scalar && hasConstZero(rhsState.scalar))) {
+    InFlightDiagnostic diag = emitError(loc)
+                              << "Unsupported cmpi with rhs not equal to 0";
+    return failure();
+  }
 
-  int32_t cmpDim = -1;
+  int32_t cmpDim = lhsState.scalar && rhsState.scalar ? 0 : -1;
   for (int32_t i = 0; i < lhsState.getRank(); i++) {
     auto dimIntAttr = getIntAttr(lhsState.dims[i]);
     if (!dimIntAttr || dimIntAttr.value() != 1) {
@@ -318,8 +359,42 @@ LogicalResult MaskState::parseCmp(arith::CmpIOp cmpOp, const Location loc,
   assert(cmpDim != -1 &&
          "Unexpected case where no dimension has size larger than 1");
 
-  auto newEnd = minOFRs(lhsState.end, rhsState.scalar, loc, builder);
-  auto newDim = subOFRs(newEnd, lhsState.start, loc, builder);
+  OpFoldResult newDim;
+  if (lhsState.scalar) {
+    assert(rhsState.scalar && "Unexpected case where rhs is not a scalar");
+    // If both lhs and rhs are scalars, we can't just derive the dimension of
+    // the mask as the minimum value: lhs/rhs could be 0 and then we don't
+    // load/store anything.
+    //
+    // Instead treat the comparison as a scalar that determines if anything
+    // should be loaded/stored by inserting a comparison + select:
+    //    dim = lhs < rhs ? lhs.dim : 0
+    newDim = compareOFRs(lhsState.scalar, rhsState.scalar, cmpOp.getPredicate(),
+                  lhsState.dims[cmpDim], builder.getIndexAttr(0),
+                  loc, builder);
+  } else if (cmpOp.getPredicate() == arith::CmpIPredicate::slt ||
+    cmpOp.getPredicate() == arith::CmpIPredicate::ult) {
+    // Important:
+    // In the case where the values we are loading are entirely masked off like
+    // the following:
+    //
+    // ---|-------|-----------|
+    //    ^       ^           ^
+    //   scalar  start       end
+    //
+    // newEnd = min(end, scalar) = scalar
+    // Now scalar < start, so simply doing dim = newEnd - start is incorrect.
+    //
+    // The correct formula is to optionally move `newDim` back to `start` using
+    // max(newEnd, start).
+    auto newEnd = minOFRs(lhsState.end, rhsState.scalar, loc, builder);
+    newEnd = maxOFRs(newEnd, lhsState.start, loc, builder);
+    newDim = subOFRs(newEnd, lhsState.start, loc, builder);
+  } else {
+    assert(cmpOp.getPredicate() == arith::CmpIPredicate::sge && rhsState.scalar
+           && hasConstZero(rhsState.scalar));
+    newDim = lhsState.dims[cmpDim];
+  }
 
   for (int32_t i = 0; i < lhsState.getRank(); i++) {
     if (i == cmpDim)
@@ -329,6 +404,58 @@ LogicalResult MaskState::parseCmp(arith::CmpIOp cmpOp, const Location loc,
   }
 
   return success();
+}
+
+LogicalResult MaskState::parseLoopIterArg(Value v, const Location loc,
+                                          OpBuilder &builder) {
+  assert(!v.getDefiningOp());
+
+  auto forOp = llvm::dyn_cast<scf::ForOp>(v.getParentRegion()->getParentOp());
+
+  if (!forOp) {
+    return failure();
+  }
+
+  // TODO: This implementation does not work with nested loops
+  if (forOp->getParentOfType<scf::ForOp>()) {
+    return failure();
+  }
+
+  auto it = llvm::find(forOp.getRegionIterArgs(), v);
+  if (it == forOp.getRegionIterArgs().end()) {
+    return failure();
+  }
+
+  auto argIndex = std::distance(forOp.getRegionIterArgs().begin(), it);
+  auto initArg = forOp.getInitArgs()[argIndex];
+  if (auto getStateOp = initArg.getDefiningOp<tts::GetStructuredStateOp>()) {
+    auto tritonValue = getStateOp->getOperand(0);
+    MaskState lhsState;
+    if (failed(lhsState.parse(tritonValue, loc, builder))) {
+      return failure();
+    }
+
+    // This is a bit of a hack!!
+    //
+    // The offsets and dimensions of a MaskState can now depend on a loop's
+    // iter-arg.
+    //
+    // Because the PtrAnalysis's pre-pass already sets up the offsets,
+    // we can create a new MaskState for each loop iteration by adding the
+    // original MaskState with the current iter-arg, which is at `argIndex +
+    // 1`.
+    //
+    // This will not work for nested loop scenarios, which would need a
+    // more robust implementation.
+    if (failed(this->addStateScalar(
+            lhsState, forOp.getRegionIterArgs()[argIndex + 1], loc, builder))) {
+      return failure();
+    }
+
+    return success();
+  }
+
+  return failure();
 }
 
 LogicalResult MaskState::parseMakeRange(triton::MakeRangeOp rangeOp,

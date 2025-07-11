@@ -8,6 +8,8 @@
 #include "triton-shared/Analysis/OpFoldResultUtils.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -49,7 +51,10 @@ bool hasConstZero(const OpFoldResult ofr) {
 Value ofrToIndexValue(const OpFoldResult ofr, const Location loc,
                       OpBuilder &b) {
   if (Value val = dyn_cast<Value>(ofr)) {
-    assert(val.getType().isIndex() && "Provided ofr is of type index");
+    assert(val.getType().isIntOrIndex());
+    if (!val.getType().isIndex()) {
+      val = b.create<arith::IndexCastOp>(loc, b.getIndexType(), val);
+    }
     return val;
   }
 
@@ -212,4 +217,71 @@ OpFoldResult minOFRs(const OpFoldResult lhs, const OpFoldResult rhs,
   return minOp.getResult();
 }
 
+OpFoldResult maxOFRs(const OpFoldResult lhs, const OpFoldResult rhs,
+                     const Location loc, OpBuilder &b) {
+  auto lhsIntAttr = getIntAttr(lhs);
+  auto rhsIntAttr = getIntAttr(rhs);
+
+  // both lhs and rhs are constants, return result directly
+  if (lhsIntAttr && rhsIntAttr)
+    return b.getIndexAttr(std::max(lhsIntAttr.value(), rhsIntAttr.value()));
+
+  // otherwise, need to create instructions to calculate new attribute value
+  auto lhsValue = dyn_cast<Value>(lhs);
+  if (lhsIntAttr) {
+    auto lhsOp =
+        b.create<arith::ConstantOp>(loc, b.getIndexAttr(lhsIntAttr.value()));
+    lhsValue = lhsOp.getResult();
+  }
+
+  auto rhsValue = dyn_cast<Value>(rhs);
+  if (rhsIntAttr) {
+    auto rhsOp =
+        b.create<arith::ConstantOp>(loc, b.getIndexAttr(rhsIntAttr.value()));
+    rhsValue = rhsOp.getResult();
+  }
+
+  auto maxOp = b.create<arith::MaxSIOp>(loc, lhsValue, rhsValue);
+  return maxOp.getResult();
+}
+
+OpFoldResult compareOFRs(const OpFoldResult lhs, const OpFoldResult rhs,
+                    const arith::CmpIPredicate pred, const OpFoldResult trueOFR,
+                    const OpFoldResult falseOFR, const Location loc, OpBuilder &b) {
+  auto lhsIntAttr = getIntAttr(lhs);
+  auto rhsIntAttr = getIntAttr(rhs);
+
+  // both lhs and rhs are constants, return the result directly
+  if (lhsIntAttr && rhsIntAttr) {
+    switch (pred) {
+      case arith::CmpIPredicate::eq:
+        return *lhsIntAttr == *rhsIntAttr ? trueOFR : falseOFR;
+      case arith::CmpIPredicate::ne:
+        return *lhsIntAttr != *rhsIntAttr ? trueOFR : falseOFR;
+      case arith::CmpIPredicate::slt:
+      case arith::CmpIPredicate::ult:
+        return *lhsIntAttr < *rhsIntAttr ? trueOFR : falseOFR;
+      case arith::CmpIPredicate::sle:
+      case arith::CmpIPredicate::ule:
+        return *lhsIntAttr <= *rhsIntAttr ? trueOFR : falseOFR;
+      case arith::CmpIPredicate::sgt:
+      case arith::CmpIPredicate::ugt:
+        return *lhsIntAttr > *rhsIntAttr ? trueOFR : falseOFR;
+      case arith::CmpIPredicate::sge:
+      case arith::CmpIPredicate::uge:
+        return *lhsIntAttr >= *rhsIntAttr ? trueOFR : falseOFR;
+      default:
+        llvm_unreachable("Unsupported predicate");
+    }
+  }
+
+  auto lhsValue = ofrToIndexValue(lhs, loc, b);
+  auto rhsValue = ofrToIndexValue(rhs, loc, b);
+  auto trueValue = ofrToIndexValue(trueOFR, loc, b);
+  auto falseValue = ofrToIndexValue(falseOFR, loc, b);
+
+  auto cmpOp = b.create<arith::CmpIOp>(loc, pred, lhsValue, rhsValue);
+  auto selectOp = b.create<arith::SelectOp>(loc, cmpOp, trueValue, falseValue);
+  return selectOp.getResult();
+}
 } // namespace mlir

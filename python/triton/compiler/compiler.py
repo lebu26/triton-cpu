@@ -315,6 +315,13 @@ def compile(src, target=None, options=None):
 
 
 def make_backend(target):
+    # Handle CPU backend selection
+    if target.backend == "cpu":
+        if os.environ.get("TRITON_USE_SHARED_BACKEND", "0") == "1":
+            return backends["triton_shared"].compiler(target)
+        return backends["cpu"].compiler(target)
+    
+    print(f"Target: {target}")
     actives = [x.compiler for x in backends.values() if x.compiler.supports_target(target)]
     if len(actives) != 1:
         raise RuntimeError(

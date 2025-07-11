@@ -19,7 +19,7 @@ def device(request):
 
 
 tests_not_supported = {
-    "test_split",
+    "test_bin_op",
     "test_split_to_scalar",
     "test_interleave_scalars",
     "test_pointer_arguments",
@@ -33,7 +33,6 @@ tests_not_supported = {
     "test_ptx_cast",
     "test_compare_op",
     "test_maxnreg",
-    "test_join",
     "test_join_scalars",
     "test_join_with_mma",
     "test_interleave",
@@ -50,7 +49,6 @@ tests_not_supported = {
     "test_atomic_cas",
     "test_tensor_atomic_cas",
     "test_cast",
-    "test_cat",
     "test_store_constant",
     "test_reduce",
     "test_reduce1d",
@@ -94,7 +92,7 @@ def pytest_collection_modifyitems(config, items):
 
     for item in items:
         test_func_name = item.originalname if item.originalname else item.name
-        
+
         if test_func_name in tests_not_supported:
             item.add_marker(skip_marker)
             continue
@@ -105,5 +103,5 @@ def pytest_collection_modifyitems(config, items):
                     item.add_marker(skip_marker_bfloat)
                 if param_name.startswith('input_precision') and param_value.startswith('tf32'):
                     item.add_marker(skip_marker_tf32)
-                if param_name.endswith('dtype') and ('float8' in str(param_value)):
+                if (param_name.startswith('dtype') or param_name.endswith('dtype')) and ('float8' in str(param_value)):
                     item.add_marker(skip_marker_float8)

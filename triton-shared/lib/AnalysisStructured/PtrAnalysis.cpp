@@ -6,12 +6,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "triton-shared/AnalysisStructured/PtrAnalysis.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Utils/StaticValueUtils.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/ValueRange.h"
+#include "mlir/IR/Value.h"
 #include "mlir/IR/Visitors.h"
+#include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
 #include "triton-shared/Analysis/MaskAnalysis.h"
 #include "triton-shared/Analysis/OpFoldResultUtils.h"
@@ -27,82 +27,16 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/LogicalResult.h"
 #include <cassert>
 #include <cstddef>
-#include <functional>
+#include <optional>
+#include <queue>
 #include <string>
 
 #define DEBUG_TYPE "triton-ptr-analysis"
 
 namespace mlir {
-
-// Extract a scalar value from v.
-// If v is a scalar, return that directly. Otherwise, parse through operations
-// (currently only support splat, sitofp, and truncf) that produce it to
-// extract the underlying scalar value. We then reconstruct the chain of
-// operations that can produce this constant with the original type. If no
-// scalar value can be extracted, a nullptr is returned.
-static Value getScalarValue(Value operand, Location loc, OpBuilder &builder) {
-  SmallVector<Operation *> ops;
-
-  auto reconstructScalarValue = [&](Value src) {
-    for (auto op = ops.rbegin(); op != ops.rend(); ++op) {
-      src = TypeSwitch<Operation *, Value>(*op)
-                .Case<arith::SIToFPOp>([&](Operation *op) {
-                  auto resType = op->getResults()[0].getType();
-                  if (auto shapedType = dyn_cast<ShapedType>(resType)) {
-                    resType = shapedType.getElementType();
-                  }
-                  return builder.create<arith::SIToFPOp>(loc, resType, src);
-                })
-                .Case<arith::TruncFOp>([&](Operation *op) {
-                  auto resType = op->getResults()[0].getType();
-                  if (auto shapedType = dyn_cast<ShapedType>(resType)) {
-                    resType = shapedType.getElementType();
-                  }
-                  return builder.create<arith::TruncFOp>(loc, resType, src);
-                })
-                .Default([](Operation *op) {
-                  llvm_unreachable("unsupported op in generating ");
-                  return nullptr;
-                });
-    }
-    return src;
-  };
-
-  while (true) {
-    if (!dyn_cast<ShapedType>(operand.getType())) {
-      return reconstructScalarValue(operand);
-    } else if (auto op = operand.getDefiningOp<arith::ConstantOp>()) {
-      if (auto attr = dyn_cast<DenseElementsAttr>(op.getValue())) {
-        if (!attr.isSplat()) {
-          InFlightDiagnostic diag = emitError(loc)
-                                    << "other value used in masked load "
-                                       "produced by unsupported instruction";
-          return nullptr;
-        }
-        auto elemValue = attr.getSplatValue<Attribute>();
-        auto constOp = arith::ConstantOp::materialize(
-            builder, elemValue, attr.getElementType(), op.getLoc());
-        return reconstructScalarValue(constOp.getResult());
-      }
-    } else if (auto op = operand.getDefiningOp<triton::SplatOp>()) {
-      operand = op.getSrc();
-    } else if (auto op = operand.getDefiningOp<arith::SIToFPOp>()) {
-      ops.push_back(op.getOperation());
-      operand = op.getIn();
-    } else if (auto op = operand.getDefiningOp<arith::TruncFOp>()) {
-      ops.push_back(op.getOperation());
-      operand = op.getIn();
-    } else {
-      InFlightDiagnostic diag = emitError(loc)
-                                << "other value used in masked load produced "
-                                   "by unsupported instruction";
-      return nullptr;
-    }
-  }
-  return nullptr;
-}
 
 namespace tts {
 
@@ -245,6 +179,28 @@ LogicalResult PtrState::addState(const PtrState &lhsState,
   return success();
 }
 
+void PtrState::dump() const {
+  llvm::dbgs() << "PtrState: ";
+  if (source) {
+    llvm::dbgs() << "source: " << source << "\n";
+  }
+  if (scalar) {
+    llvm::dbgs() << "scalar: " << scalar << "\n";
+  }
+
+  llvm::dbgs() << "offsets: ";
+  llvm::interleave(offsets, llvm::dbgs(), "\n");
+  llvm::dbgs() << "\nstrides: ";
+  llvm::interleave(strides, llvm::dbgs(), "\n");
+  llvm::dbgs() << "\nsizes: ";
+  llvm::interleave(sizes, llvm::dbgs(), "\n");
+  llvm::dbgs() << "\nshape: ";
+  llvm::interleave(shape, llvm::dbgs(), "\n");
+  llvm::dbgs() << "\norder: ";
+  llvm::interleave(order, llvm::dbgs(), "\n");
+  llvm::dbgs() << "\n";
+}
+
 LogicalResult PtrState::mulState(const PtrState &lhsState,
                                  const PtrState &rhsState, Operation *op,
                                  OpBuilder &builder) {
@@ -259,9 +215,6 @@ LogicalResult PtrState::mulState(const PtrState &lhsState,
     return failure();
   }
 
-  assert(!(lhsState.scalar && rhsState.scalar) &&
-         "do not expect to see both lhs and rhs are scalars");
-
   // currently do not support both tensors are effectively non-scalar
   if (!lhsState.scalar && !rhsState.scalar) {
     op->emitRemark(
@@ -275,6 +228,11 @@ LogicalResult PtrState::mulState(const PtrState &lhsState,
 
   if (!rhs->scalar && lhs->scalar) {
     std::swap(lhs, rhs);
+  }
+
+  if (lhsState.scalar && rhsState.scalar) {
+    scalar = builder.create<arith::MulIOp>(
+        loc, lhsState.scalar, rhsState.scalar);
   }
 
   for (uint64_t i = 0; i < lhs->sizes.size(); i++) {
@@ -419,6 +377,14 @@ LogicalResult PtrAnalysis::visitOperandRem(arith::RemSIOp remOp,
   return success();
 }
 
+LogicalResult PtrAnalysis::visitOperandExtSI(arith::ExtSIOp extOp,
+                                             PtrState &state,
+                                             const Location loc,
+                                             OpBuilder &builder) {
+  assert(state.isEmpty());
+  return visitOperand(extOp.getIn(), state, loc, builder);
+}
+
 LogicalResult PtrAnalysis::visitOperandMakeRange(triton::MakeRangeOp rangeOp,
                                                  PtrState &state, Location loc,
                                                  OpBuilder &builder) {
@@ -557,6 +523,7 @@ LogicalResult PtrAnalysis::visitOperandAddptr(triton::AddPtrOp addptrOp,
   PtrState ptrState;
   if (visitOperand(addptrOp.getPtr(), ptrState, addptrOp.getLoc(), builder)
           .failed()) {
+    // assert(0);
     return failure();
   }
 
@@ -746,13 +713,18 @@ LogicalResult PtrAnalysis::visitOperand(Value operand, PtrState &state,
     return visitOperandConstSplat(op, state, loc, builder);
   } else if (auto op = operand.getDefiningOp<arith::RemSIOp>()) {
     return visitOperandRem(op, state, loc, builder);
+  } else if (auto op = operand.getDefiningOp<arith::ExtSIOp>()) {
+    return visitOperandExtSI(op, state, loc, builder);
   } else if (auto op = operand.getDefiningOp<scf::ForOp>()) {
     return visitOperandForOp(op, operand, state, loc, builder);
   } else if (!operand.getDefiningOp()) {
+    if (!knownPtrs.contains(operand)) {
+      return failure();
+    }
+
     // This operand must be an iter-arg of an inner-loop in a multiple-level
     // nested loop, which means its PtrState must have already been populated
     // during rewriteForOp of the parent loop.
-    assert(knownPtrs.contains(operand));
     state = knownPtrs[operand];
     return success();
   } else {
@@ -941,7 +913,6 @@ FailureOr<PtrState> PtrAnalysis::getLoopIterArgPtrState(scf::ForOp forOp,
 
 FailureOr<PtrState> PtrAnalysis::getLoopResultPtrState(scf::ForOp forOp,
                                                        size_t index) {
-
   auto state = getLoopInitArgPtrState(forOp, index);
   if (failed(state)) {
     return failure();
@@ -953,22 +924,25 @@ FailureOr<PtrState> PtrAnalysis::getLoopResultPtrState(scf::ForOp forOp,
 }
 
 LogicalResult PtrAnalysis::rewriteForOp(scf::ForOp op) {
-  for (auto [i, arg] : llvm::enumerate(op.getInitArgs())) {
-    if (!isPointerType(arg.getType())) {
+  for (auto [i, arg] : llvm::enumerate(op.getRegionIterArgs())) {
+    if (!maybeStructuredArgs.contains(arg)) {
       continue;
     }
 
     auto state = getLoopIterArgPtrState(op, i);
     if (failed(state)) {
-      op.emitError(
+      // Because the maybeStructuredArgs may contain values that are not
+      // considered structured by PtrAnalysis, failing to retrieve the PtrState
+      // should not fail the rewrite process.
+      // We emit an error for diagnostics and debugging purposes.
+      op->emitWarning(
           "Rewrite for-op failed. Could not find PtrState for iter-arg index " +
           std::to_string(i));
-      return failure();
+      continue;
     }
 
     // Save the current init arg's PtrState
-    auto key = op.getRegionIterArgs()[i];
-    knownPtrs[key] = state.value();
+    knownPtrs[arg] = state.value();
 
     // For tensors of pointers, create a tts.make_tptr at the beginning of the
     // loop body that correspond to this region iter arg. In case it is used
@@ -993,10 +967,14 @@ LogicalResult PtrAnalysis::rewriteForOp(scf::ForOp op) {
     // beginning of the loop body. We don't lower tt.load and tt.store on
     // scalars in this pass; pointer arithmetics can also just use the
     // original pointer.
-    if (state->getRank() != 0) {
-      OpBuilder builder(op.getRegion());
-      auto maketptrOp = state->createTTSMakeTensorPtrOp(builder, op.getLoc());
-      ptrMap.map(key, maketptrOp.getResult());
+    // Note that there can be tensor of indices in iter-arg, so we only create
+    // the make_tensor_ptr op when the arg is of pointer type.
+    if (isPointerType(arg.getType())) {
+      if (state->getRank() != 0) {
+        OpBuilder builder(op.getRegion());
+        auto maketptrOp = state->createTTSMakeTensorPtrOp(builder, op.getLoc());
+        ptrMap.map(arg, maketptrOp.getResult());
+      }
     }
   }
 
@@ -1012,30 +990,38 @@ LogicalResult PtrAnalysis::rewriteForOp(scf::ForOp op) {
 
 LogicalResult
 PtrAnalysis::rewriteGetStructuredStateOp(tts::GetStructuredStateOp op) {
-  auto tritonPtr = op->getOperand(0);
+  auto tritonValue = op->getOperand(0);
 
-  // If this pointer isn't known, it means PtrAnalysis has failed to analyze
-  // this pointer. In such cases, simply remap all uses of the
-  // structured-pointer back to its original pointer.
-  if (!knownPtrs.contains(tritonPtr)) {
+  // If this triton value isn't known, it means PtrAnalysis has failed to
+  // analyze this pointer. In such cases, simply remap all uses of the
+  // structured value back to its original triton value.
+  if (!knownPtrs.contains(tritonValue)) {
     op.emitRemark(
         "Rewrite GetStructuredStateOp failed. Could not find PtrState.");
-    op.getResult(0).replaceAllUsesWith(tritonPtr);
+    op.getResult(0).replaceAllUsesWith(tritonValue);
     return failure();
   }
 
-  tts::PtrState state = knownPtrs[tritonPtr];
-  assert(ptrMap.contains(tritonPtr));
-  Value remappedPtr = ptrMap.lookup(tritonPtr);
+  tts::PtrState state = knownPtrs[tritonValue];
+  Value remappedValue =
+      ptrMap.contains(tritonValue) ? ptrMap.lookup(tritonValue) : tritonValue;
 
-  SmallVector<Value> replacements{remappedPtr};
+  SmallVector<Value> replacements{remappedValue};
+  OpBuilder builder(op);
 
   if (state.getRank() == 0) {
     // For scalar pointers, the scalar contains the offset and is the only
     // relevant state that could be updated by the loop.
-    replacements.push_back(state.scalar);
+    if (state.scalar) {
+      replacements.push_back(state.scalar);
+    } else {
+      // This operand is a pointer directly from the kernel arguments.
+      // Use offset 0.
+      assert(!tritonValue.getDefiningOp());
+      replacements.push_back(builder.create<arith::ConstantOp>(
+          op.getLoc(), builder.getIndexAttr(0)));
+    }
   } else {
-    OpBuilder builder(op);
     for (auto [j, s] : llvm::enumerate(state.offsets)) {
       auto sIntAttr = getIntAttr(s);
       if (sIntAttr) {
@@ -1064,7 +1050,8 @@ PtrAnalysis::rewriteGetStructuredStateOp(tts::GetStructuredStateOp op) {
   return success();
 }
 
-LogicalResult PtrAnalysis::rewriteLoadOp(triton::LoadOp op) {
+LogicalResult PtrAnalysis::rewriteLoadOp(triton::LoadOp op,
+                                         bool useUnsafeMask) {
   auto ptr = ptrMap.lookupOrNull(op.getPtr());
   auto mask = op.getMask();
   auto other = op.getOther();
@@ -1083,7 +1070,7 @@ LogicalResult PtrAnalysis::rewriteLoadOp(triton::LoadOp op) {
   }
 
   ArrayRef<OpFoldResult> dims;
-  mlir::triton::MaskState mstate;
+  mlir::triton::MaskState mstate(useUnsafeMask);
   Value scalarOther;
 
   OpBuilder builder(op);
@@ -1100,7 +1087,7 @@ LogicalResult PtrAnalysis::rewriteLoadOp(triton::LoadOp op) {
   if (other) {
     assert(mask && "other value used while no masks are specified");
 
-    scalarOther = getScalarValue(other, loc, builder);
+    scalarOther = utils::getScalarValue(other, loc, builder);
     if (!scalarOther) {
       op->emitRemark("other value used in masked load produced by "
                      "unsupported instruction");
@@ -1120,7 +1107,88 @@ LogicalResult PtrAnalysis::rewriteLoadOp(triton::LoadOp op) {
   return success();
 }
 
-LogicalResult PtrAnalysis::rewriteStoreOp(triton::StoreOp op) {
+// Structured values from the TritonStructuredDialect have offsets and strides
+// that might change in each loop iteration and hence will appear in an scf.for
+// iter-args like so:
+//
+// %structured, %offsets, %strides  = tts.get_structured_state
+// scf.for (%arg0 = %structured, %arg1 = %offsets, %arg2 = %strides) {
+//   %a = %arg0 + 1
+//   %b = %b + 2
+//   scf.for (%arg1 = %b) {
+//      ...
+//   }
+// }
+//
+// In `rewriteForOp`, we have to recognize such structured values in order to
+// rewrite their PtrState accordingly. Previously, only values of Pointer-like
+// type (e.g.: tensor<tt.ptr<>> or tt.ptr<tensor<>>), so detecting these values
+// is as easy as checking the type.
+//
+// Now, tensor of indices could also appear in a loop's iter-arg. To reliably
+// detect all such cases, we perform a BFS-like traversal of the IR where the
+// sources are the results of `tts.get_structured_state`. All values that
+// originate from the results of `tts.get_structured_state` are consider
+// "maybeStructured". If a loop's iter-arg is considered "maybeStructured", we
+// must set up their PtrState during `rewriteForOp`.
+void PtrAnalysis::initializeMaybeStructuredArgs(Operation *op) {
+  std::queue<Value> q;
+  DenseSet<Value> visited;
+
+  op->walk([&q, &visited](tts::GetStructuredStateOp getStateOp) {
+    Value value = getStateOp->getResult(0);
+    visited.insert(value);
+    q.push(value);
+  });
+
+  while (!q.empty()) {
+    auto v = q.front();
+    q.pop();
+    for (auto user : v.getUsers()) {
+      // scf.for is a special case. We have 2 set of values to consider:
+      // - iter-args
+      // - loop results
+      // for every init arg that originates from a `tts.get_structured_state`
+      // op, its corresponding iter-arg and loop result will also be considered
+      // "maybeStructured".
+      if (auto forOp = dyn_cast<scf::ForOp>(user)) {
+        auto it = llvm::find(forOp.getInitArgs(), v);
+
+        if (it == forOp.getInitArgs().end()) {
+          continue;
+        }
+
+        auto argIndex = std::distance(forOp.getInitArgs().begin(), it);
+        auto iterArg = forOp.getRegionIterArg(argIndex);
+        auto tiedLoopRes = forOp.getTiedLoopResult(iterArg);
+
+        SmallVector<Value> neighbors{iterArg, tiedLoopRes};
+        for (auto neighbor : neighbors) {
+          maybeStructuredArgs.insert(neighbor);
+          if (!visited.contains(neighbor)) {
+            visited.insert(neighbor);
+            q.push(neighbor);
+          }
+        }
+
+      } else {
+        for (auto res : user->getResults()) {
+          if (res.getType() != v.getType()) {
+            continue;
+          }
+          maybeStructuredArgs.insert(res);
+          if (!visited.contains(res)) {
+            visited.insert(res);
+            q.push(res);
+          }
+        }
+      }
+    }
+  }
+}
+
+LogicalResult PtrAnalysis::rewriteStoreOp(triton::StoreOp op,
+                                          bool useUnsafeMask) {
   auto ptr = ptrMap.lookupOrNull(op.getPtr());
   auto val = op.getValue();
   auto mask = op.getMask();
@@ -1139,7 +1207,7 @@ LogicalResult PtrAnalysis::rewriteStoreOp(triton::StoreOp op) {
   }
 
   ArrayRef<OpFoldResult> dims;
-  mlir::triton::MaskState mstate;
+  mlir::triton::MaskState mstate(useUnsafeMask);
 
   OpBuilder builder(op);
 
@@ -1164,7 +1232,7 @@ LogicalResult PtrAnalysis::rewriteStoreOp(triton::StoreOp op) {
   return success();
 }
 
-LogicalResult PtrAnalysis::rewriteOp(Operation *rootOp) {
+LogicalResult PtrAnalysis::rewriteOp(Operation *rootOp, bool useUnsafeMask) {
   LLVM_DEBUG({
     llvm::dbgs() << "rewriting rootOp\n";
     rootOp->dump();
@@ -1195,14 +1263,14 @@ LogicalResult PtrAnalysis::rewriteOp(Operation *rootOp) {
           return WalkResult::advance();
         })
         .Case<triton::LoadOp>([&](auto load) {
-          if (rewriteLoadOp(load).failed()) {
+          if (rewriteLoadOp(load, useUnsafeMask).failed()) {
             load->emitRemark("PtrAnalysis: Failed to rewrite LoadOp");
             return WalkResult::advance();
           }
           return WalkResult::skip();
         })
         .Case<triton::StoreOp>([&](auto store) {
-          if (rewriteStoreOp(store).failed()) {
+          if (rewriteStoreOp(store, useUnsafeMask).failed()) {
             store->emitRemark("PtrAnalysis: Failed to rewrite StoreOp");
             return WalkResult::advance();
           }
@@ -1211,13 +1279,40 @@ LogicalResult PtrAnalysis::rewriteOp(Operation *rootOp) {
         .Case<scf::ForOp>([&](auto forOp) {
           // `rewriteForOp` recursively visits its children, so regardless
           // whether the rewrite succeeds or not, we need to return "skip" so
-          // that the the walk does not visit the for-op's child operations the
-          // second time.
+          // that the the walk does not visit the for-op's child operations
+          // the second time.
           if (rewriteForOp(forOp).failed()) {
             forOp->emitRemark("PtrAnalysis: Failed to rewrite ForOp");
           }
           return WalkResult::skip();
         })
+        .Case<tts::GetStructuredStateOp>(
+            [&](tts::GetStructuredStateOp getStateOp) {
+              // For tensor of indices potentially being used in pointer
+              // arithmetic sequence, we need to manually populate the state of
+              // none already exists.
+              // This process is necessary because unlike triton pointers in a
+              // loop which always have a `tt.addptr` that triggers the rewrite
+              // process which includes generating the ops for updating offsets
+              // and strides, tensor of indices only have a simple `arith.addi`
+              // (or other arith ops).
+              // Without visiting these ops manually, the ops to update the
+              // offsets and strides would not be generated.
+              auto tritonValue = getStateOp->getOperand(0);
+              if (!knownPtrs.contains(tritonValue)) {
+                PtrState state;
+                OpBuilder b(getStateOp);
+                if (succeeded(visitOperand(tritonValue, state,
+                                           getStateOp->getLoc(), b))) {
+                  knownPtrs[tritonValue] = state;
+                } else {
+                  getStateOp->emitRemark("PtrAnalysis: Failed to populate ptr "
+                                         "state for tensor of indices");
+                }
+              }
+
+              return WalkResult::skip();
+            })
         .Default([&](auto) { return WalkResult::advance(); });
   });
 

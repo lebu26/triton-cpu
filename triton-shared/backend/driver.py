@@ -350,7 +350,7 @@ class CPUUtils(object):
           kernel_obj, # function
           None,       # n_regs
           None,        # n_spills
-          sys.maxsize, # n_max_threads
+          # sys.maxsize, # n_max_threads
         )
 
 

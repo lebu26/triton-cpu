@@ -8,7 +8,11 @@ def TritonToStructured : Pass<"triton-to-structured", "mlir::ModuleOp"> {
   let constructor = "triton::createTritonToStructuredPass()";
   let options = [
       Option<"runPrepassOnly", "run-prepass-only", "bool", /*default*/"false",
-             "Only run the pre-processing pass which inserts tts.get_structured_state ops used in scf.for">
+             "Only run the pre-processing pass which inserts tts.get_structured_state ops used in scf.for">,
+      Option<"skipPrepass", "skip-prepass", "bool", /*default*/"false",
+             "Skip the prepass">,
+      Option<"useUnsafeMask", "use-unsafe-mask", "bool", /*default*/"false",
+             "Assume that the mask bounds are never less than starting offsets. May produce incorrect results.">
   ];
 }
 

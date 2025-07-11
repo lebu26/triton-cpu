@@ -1,16 +1,20 @@
-#include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Types.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OperationSupport.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
-#include "triton/Dialect/Triton/IR/Types.h"
+
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
+
 #include <cstdint>
 #include <optional>
 #include <utility>
@@ -23,6 +27,77 @@ using namespace mlir::tts;
 
 namespace mlir {
 namespace tts {
+
+namespace utils {
+// Extract a scalar value from v.
+// If v is a scalar, return that directly. Otherwise, parse through operations
+// (currently only support splat, sitofp, and truncf) that produce it to
+// extract the underlying scalar value. We then reconstruct the chain of
+// operations that can produce this constant with the original type. If no
+// scalar value can be extracted, a nullptr is returned.
+Value getScalarValue(Value operand, Location loc, OpBuilder &builder) {
+  SmallVector<Operation *> ops;
+
+  auto reconstructScalarValue = [&](Value src) {
+    for (auto op = ops.rbegin(); op != ops.rend(); ++op) {
+      src = TypeSwitch<Operation *, Value>(*op)
+                .Case<arith::SIToFPOp>([&](Operation *op) {
+                  auto resType = op->getResults()[0].getType();
+                  if (auto shapedType = dyn_cast<ShapedType>(resType)) {
+                    resType = shapedType.getElementType();
+                  }
+                  return builder.create<arith::SIToFPOp>(loc, resType, src);
+                })
+                .Case<arith::TruncFOp>([&](Operation *op) {
+                  auto resType = op->getResults()[0].getType();
+                  if (auto shapedType = dyn_cast<ShapedType>(resType)) {
+                    resType = shapedType.getElementType();
+                  }
+                  return builder.create<arith::TruncFOp>(loc, resType, src);
+                })
+                .Default([](Operation *op) {
+                  llvm_unreachable("unsupported op in generating ");
+                  return nullptr;
+                });
+    }
+    return src;
+  };
+
+  while (true) {
+    if (!dyn_cast<ShapedType>(operand.getType())) {
+      return reconstructScalarValue(operand);
+    } else if (auto op = operand.getDefiningOp<arith::ConstantOp>()) {
+      if (auto attr = dyn_cast<DenseElementsAttr>(op.getValue())) {
+        if (!attr.isSplat()) {
+          InFlightDiagnostic diag = emitError(loc)
+                                    << "other value used in masked load "
+                                       "produced by unsupported instruction";
+          return nullptr;
+        }
+        auto elemValue = attr.getSplatValue<Attribute>();
+        auto constOp = arith::ConstantOp::materialize(
+            builder, elemValue, attr.getElementType(), op.getLoc());
+        return reconstructScalarValue(constOp.getResult());
+      }
+    } else if (auto op = operand.getDefiningOp<triton::SplatOp>()) {
+      operand = op.getSrc();
+    } else if (auto op = operand.getDefiningOp<arith::SIToFPOp>()) {
+      ops.push_back(op.getOperation());
+      operand = op.getIn();
+    } else if (auto op = operand.getDefiningOp<arith::TruncFOp>()) {
+      ops.push_back(op.getOperation());
+      operand = op.getIn();
+    } else {
+      InFlightDiagnostic diag = emitError(loc)
+                                << "other value used in masked load produced "
+                                   "by unsupported instruction";
+      return nullptr;
+    }
+  }
+  return nullptr;
+}
+
+} // namespace utils
 
 void MakeTensorPtrOp::build(OpBuilder &b, OperationState &state, Value base,
                             ArrayRef<int64_t> sizes,
@@ -94,9 +169,8 @@ void StoreOp::build(OpBuilder &b, OperationState &state, Value ptr, Value value,
 }
 
 LogicalResult GetStructuredStateOp::verify() {
-  return success();
   auto expectedOffsetAndStrideTypes =
-      getOffsetAndStrideTypes(getContext(), getStructuredPtr().getType());
+      getOffsetAndStrideTypes(getContext(), getInput().getType());
 
   if (!expectedOffsetAndStrideTypes.has_value()) {
     return failure();
@@ -112,8 +186,8 @@ LogicalResult GetStructuredStateOp::verify() {
 }
 
 void GetStructuredStateOp::build(OpBuilder &b, OperationState &state,
-                                 Value ptr) {
-  auto type = ptr.getType();
+                                 Value val) {
+  auto type = val.getType();
 
   // Builder cannot fail, so we default to empty offset and stride types.
   // The invalid op will be rejected by the verifier later.
@@ -121,13 +195,12 @@ void GetStructuredStateOp::build(OpBuilder &b, OperationState &state,
       getOffsetAndStrideTypes(b.getContext(), type)
           .value_or(std::make_pair(SmallVector<Type>{}, SmallVector<Type>{}));
 
-  build(b, state, ptr.getType(), offsetTypes, strideTypes, ptr);
+  build(b, state, val.getType(), offsetTypes, strideTypes, val);
 }
 
 std::optional<std::pair<SmallVector<Type>, SmallVector<Type>>>
-GetStructuredStateOp::getOffsetAndStrideTypes(MLIRContext *context,
-                                              Type ptrLikeType) {
-  auto sizes = getOffsetAndStrideSegmentSizes(ptrLikeType);
+GetStructuredStateOp::getOffsetAndStrideTypes(MLIRContext *context, Type type) {
+  auto sizes = getOffsetAndStrideSegmentSizes(type);
   if (!sizes.has_value()) {
     return std::nullopt;
   }
@@ -137,21 +210,28 @@ GetStructuredStateOp::getOffsetAndStrideTypes(MLIRContext *context,
 }
 
 std::optional<std::pair<int32_t, int32_t>>
-GetStructuredStateOp::getOffsetAndStrideSegmentSizes(Type ptrLikeType) {
+GetStructuredStateOp::getOffsetAndStrideSegmentSizes(Type type) {
   int32_t offsetSegmentSize = 0;
   int32_t strideSegmentSize = 0;
 
-  // Unstructured pointers (tensor<!tt.ptr<type>>)
-  if (auto tensorType = llvm::dyn_cast<RankedTensorType>(ptrLikeType)) {
-    if (auto ptrType =
-            dyn_cast<triton::PointerType>(tensorType.getElementType())) {
+  if (auto tensorType = llvm::dyn_cast<RankedTensorType>(type)) {
+    if (tensorType.getElementType().isIntOrIndex()) {
+      // Tensors of offsets
+      // Important note:
+      // We only care about tensor of index / int (in addition to pointer type)
+      // because only values of int and index type can potentially be part of a
+      // pointer arithmetic sequence.
+      offsetSegmentSize = strideSegmentSize = tensorType.getRank();
+    } else if (auto ptrType =
+                   dyn_cast<triton::PointerType>(tensorType.getElementType())) {
+      // Unstructured pointers (tensor<!tt.ptr<type>>)
       // Each tensor of rank k gets k values for its offsets and k values for
       // its strides, all of which has Index type.
       offsetSegmentSize = strideSegmentSize = tensorType.getRank();
     }
   }
   // Block pointers (!tt.ptr<tensor<type>> or !tt.ptr<type>)
-  else if (auto ptrType = llvm::dyn_cast<triton::PointerType>(ptrLikeType)) {
+  else if (auto ptrType = llvm::dyn_cast<triton::PointerType>(type)) {
     if (auto tensorType =
             llvm::dyn_cast<RankedTensorType>(ptrType.getPointeeType())) {
       // Each tensor of rank k gets k values for its offsets and k values for
