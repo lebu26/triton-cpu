@@ -11,6 +11,8 @@ from pathlib import Path
 from triton.runtime.cache import get_cache_manager
 from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
+import shutil
+from pdb import set_trace as st
 
 # -------------------- Launcher ----------------------------
 def _ty_to_cpp(ty):
@@ -61,6 +63,11 @@ def _format_of(ty):
     }[ty]
 
 def _generate_launcher(constants, signature, kernel_name):
+    '''
+    constants = {(7,): 1, (9,): 1, (11,): 1, (12,): 32, (13,): 32, (14,): 32, (15,): 8, (16,): ''}
+    signature =  {0: '*fp32', 1: '*fp32', 2: '*fp32', 3: 'i32', 4: 'i32', 5: 'i32', 6: 'i32', 7: 'constexpr', 8: 'i32', 9: 'constexpr', 10: 'i32', 11: 'constexpr', 12: 'constexpr', 13: 'constexpr', 14: 'constexpr', 15: 'constexpr', 16: 'constexpr'}
+    '''
+
     arg_decls = ', '.join(f"{_ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
     args_format = ''.join([_format_of(_extracted_type(ty)) for ty in signature.values()])
     format = "iiiOOOO" + args_format
@@ -287,6 +294,7 @@ def compile_module(launcher_src, kernel_placeholder_name):
             raise RuntimeError(f"Cannot find {name} module in {cache_path}")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
+        ## add a final 32 arg at the end
         return mod.launch(gridX, gridY, gridZ,
                           kernel_metadata, launch_metadata,
                           launch_enter_hook, launch_exit_hook,
@@ -299,17 +307,30 @@ class CPULauncher(object):
 
     def __init__(self, src, metadata):
         kernel_placeholder_name = "KERNEL_NAME_PLACEHOLDER"
-
         constants = src.constants if hasattr(src, "constants") else dict()
         cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
         constants = {cst_key(key): value for key, value in constants.items()}
         signature = {cst_key(key): value for key, value in src.signature.items()}
+        constants_aux = {i: v for i, v in constants.items()}
+        for i, v in constants_aux.items():
+          signature[i] = "constexpr"
         launcher_src = _generate_launcher(constants, signature, kernel_placeholder_name)
+        # Save constants and signature as attributes of the launcher to use in __call__ 
+        self.constants = constants
         # Later KERNEL_NAME_PLACEHOLDER will be used to assign the kernel name
         # in the following launch function.
         self.launch = compile_module(launcher_src, kernel_placeholder_name)
 
     def __call__(self, *args, **kwargs):
+        ## Add constanst to args
+        args = list(args)
+        offset = 9 ## skips first 9 args
+        for idx, val in self.constants.items():
+          adjusted_idx = idx + offset
+          if adjusted_idx >= len(args):
+            # Extend the list with `None` (or any default) up to the needed length
+            args.extend([None] * (adjusted_idx + 1 - len(args)))
+          args[adjusted_idx] = val
         self.launch(*args, **kwargs)
 
 
@@ -350,7 +371,6 @@ class CPUUtils(object):
           kernel_obj, # function
           None,       # n_regs
           None,        # n_spills
-          # sys.maxsize, # n_max_threads
         )
 
 
