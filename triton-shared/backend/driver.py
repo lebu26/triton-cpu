@@ -1,6 +1,8 @@
 import hashlib
 import tempfile
 import sysconfig
+import time
+import triton
 
 import os, subprocess, tempfile, platform
 import importlib.util
@@ -11,7 +13,6 @@ from pathlib import Path
 from triton.runtime.cache import get_cache_manager
 from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
-import shutil
 from pdb import set_trace as st
 
 # -------------------- Launcher ----------------------------
@@ -373,6 +374,61 @@ class CPUUtils(object):
           None,        # n_spills
         )
 
+class CPUDeviceInterface:
+
+    class HooksTimeAccessor:
+
+        def __init__(self, di):
+            self.di = di
+            self.record_idx = 0
+
+        def elapsed_time(self, end_event) -> float:
+            total_time = 0
+            for i in range(self.record_idx, end_event.record_idx):
+                total_time += self.di.kernel_times[i]
+            return total_time * 1000
+
+        def record(self):
+            self.record_idx = len(self.di.kernel_times)
+
+    class TimerEvent:
+
+        def __init__(self):
+            self.timer = 0
+
+        def elapsed_time(self, end_event) -> float:
+            return (end_event.timer - self.timer) * 1000
+
+        def record(self):
+            self.timer = time.perf_counter()
+
+    def __init__(self):
+        self.kernel_times = []
+        self.last_start = 0
+        self.use_hooks = False
+        triton.compiler.CompiledKernel.launch_enter_hook = None
+        triton.compiler.CompiledKernel.launch_exit_hook = None
+
+    def enable_hook_timing(self):
+        self.use_hooks = True
+        triton.compiler.CompiledKernel.launch_enter_hook = lambda arg: self._enter_hook()
+        triton.compiler.CompiledKernel.launch_exit_hook = lambda arg: self._exit_hook()
+
+    def synchronize(self):
+        pass
+
+    def _enter_hook(self):
+        self.last_start = time.perf_counter()
+
+    def _exit_hook(self):
+        self.kernel_times.append(time.perf_counter() - self.last_start)
+
+    def Event(self, enable_timing=True):
+        if self.use_hooks:
+            return CPUDeviceInterface.HooksTimeAccessor(self)
+        return CPUDeviceInterface.TimerEvent()
+
+
 
 class CPUDriver(DriverBase):
 
@@ -420,3 +476,41 @@ class CPUDriver(DriverBase):
     def map_python_to_cpp_type(self, ty: str) -> str:
         return _ty_to_cpp(ty)
   
+    def get_device_interface(self):
+        return CPUDeviceInterface()
+
+    def get_empty_cache_for_benchmark(self):
+        import numpy as np
+
+        # A typical LLC size for high-end server CPUs are ~400MB.
+        cache_size = 512 * 1024 * 1024
+        return np.empty(int(cache_size // 4), dtype=np.int32)
+
+
+    def clear_cache(self, cache):
+        global tl
+        import triton.language as tl
+
+        class Pointer:
+
+            def __init__(self, data):
+                self.data = data
+                self.dtype = data.dtype
+
+            def data_ptr(self):
+                return self.data.ctypes.data
+
+        @triton.jit
+        def clear_kernel(x_ptr, n_elements, BLOCK_SIZE: tl.constexpr, TILE_SIZE: tl.constexpr):
+            pid = tl.program_id(axis=0)
+            block_start = pid * BLOCK_SIZE
+            for i in range(0, tl.cdiv(BLOCK_SIZE, TILE_SIZE)):
+                offsets = block_start + i * TILE_SIZE + tl.arange(0, TILE_SIZE)
+                mask = offsets < n_elements
+                tl.store(x_ptr + offsets, 0, mask=mask)
+
+        n_elements = len(cache)
+        BLOCK_SIZE = 4096
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]), )
+        clear_kernel[grid](Pointer(cache), n_elements, BLOCK_SIZE, TILE_SIZE=16)
+
