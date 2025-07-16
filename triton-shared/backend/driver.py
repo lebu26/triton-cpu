@@ -13,7 +13,6 @@ from pathlib import Path
 from triton.runtime.cache import get_cache_manager
 from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
-from pdb import set_trace as st
 
 # -------------------- Launcher ----------------------------
 def _ty_to_cpp(ty):
@@ -64,10 +63,6 @@ def _format_of(ty):
     }[ty]
 
 def _generate_launcher(constants, signature, kernel_name):
-    '''
-    constants = {(7,): 1, (9,): 1, (11,): 1, (12,): 32, (13,): 32, (14,): 32, (15,): 8, (16,): ''}
-    signature =  {0: '*fp32', 1: '*fp32', 2: '*fp32', 3: 'i32', 4: 'i32', 5: 'i32', 6: 'i32', 7: 'constexpr', 8: 'i32', 9: 'constexpr', 10: 'i32', 11: 'constexpr', 12: 'constexpr', 13: 'constexpr', 14: 'constexpr', 15: 'constexpr', 16: 'constexpr'}
-    '''
 
     arg_decls = ', '.join(f"{_ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
     args_format = ''.join([_format_of(_extracted_type(ty)) for ty in signature.values()])
@@ -295,7 +290,6 @@ def compile_module(launcher_src, kernel_placeholder_name):
             raise RuntimeError(f"Cannot find {name} module in {cache_path}")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        ## add a final 32 arg at the end
         return mod.launch(gridX, gridY, gridZ,
                           kernel_metadata, launch_metadata,
                           launch_enter_hook, launch_exit_hook,
@@ -374,6 +368,7 @@ class CPUUtils(object):
           None,        # n_spills
         )
 
+## Copy and paste from the CPU backend just for compatibility.
 class CPUDeviceInterface:
 
     class HooksTimeAccessor:
@@ -476,6 +471,7 @@ class CPUDriver(DriverBase):
     def map_python_to_cpp_type(self, ty: str) -> str:
         return _ty_to_cpp(ty)
   
+    ## Copy and paste from the CPU backend just for compatibility.
     def get_device_interface(self):
         return CPUDeviceInterface()
 
