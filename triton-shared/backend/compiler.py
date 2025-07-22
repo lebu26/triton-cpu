@@ -1,5 +1,5 @@
 from triton.backends.compiler import BaseBackend, GPUTarget
-from triton._C.libtriton import ir, passes
+from triton._C.libtriton import ir, passes, cpu, llvm
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 from types import ModuleType
@@ -17,6 +17,7 @@ from mlir.ir import *
 from mlir.dialects import transform
 from mlir.dialects.transform import pdl as transform_pdl
 from mlir.dialects.transform import structured, loop, vector, bufferization
+
 
 def _get_triton_shared_opt_path() -> str:
     path = os.getenv("TRITON_SHARED_OPT_PATH", "")
@@ -39,267 +40,6 @@ def _dump_ir_if_needed(files):
     for f in files:
         shutil.copy(f, os.path.join(path, os.path.basename(f)))
 
-
-def _ttir_to_ttsharedir(mod):
-    # Get Triton-MLIR as string
-    ttir_code = str(mod)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        src_path = os.path.join(tmpdir, "tt.mlir")
-        dst_path = os.path.join(tmpdir, "ttshared.mlir")
-        Path(src_path).write_text(ttir_code)
-        _dump_ir_if_needed([src_path])
-        triton_shared_opt_path = _get_triton_shared_opt_path()
-        subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "-o", dst_path])
-        return Path(dst_path).read_text()
-
-
-def _optimize_ttsharedir(ttsharedir: str):
-    # We don't apply any optimizations now, but we can add passes if needed.
-    return ttsharedir
-
-def extract_mlir_function(filepath: str) -> None:
-    """
-    Reads an MLIR source file, retains external llvm.func declarations and
-    extracts the first llvm.func definition with a body, then overwrites the file
-    with these declarations followed by the function body.
-
-    Args:
-        filepath: Path to the MLIR source file to process.
-    """
-    with open(filepath, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
-
-    decl_pattern = re.compile(r"^\s*llvm\.func\b.*\)(?:\s*->.*)?\s*$")
-    body_start_pattern = re.compile(r"^\s*llvm\.func\b.*\{")
-
-    decl_lines = []
-    body_lines = []
-    in_body = False
-    brace_balance = 0
-
-    for line in lines:
-        if not in_body:
-            # Collect external declarations (no body)
-            if decl_pattern.match(line) and not body_start_pattern.search(line):
-                decl_lines.append(line)
-                continue
-            # Detect start of first function with body
-            if body_start_pattern.search(line):
-                in_body = True
-                brace_balance = line.count('{') - line.count('}')
-                body_lines.append(line)
-                continue
-        else:
-            body_lines.append(line)
-            brace_balance += line.count('{') - line.count('}')
-            if brace_balance == 0:
-                break
-
-    if not body_lines:
-        raise ValueError(f"No 'llvm.func' definition with body found in {filepath}")
-
-    # Dedent the function body block
-    dedented_body = textwrap.dedent(''.join(body_lines)).strip() + '\n'
-
-    # Combine declarations and body
-    output = ''.join(decl_lines).strip()
-    if decl_lines:
-        output += '\n\n'
-    output += dedented_body
-
-    # Overwrite file
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(output)
-
-
-def _ttsharedir_to_llir(ttsharedir: str):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ttshared_path = os.path.join(tmpdir, "ttshared.mlir")
-        llmlir_path = os.path.join(tmpdir, "ll.mlir")
-        llir_path = os.path.join(tmpdir, "ll.ir")
-        Path(ttshared_path).write_text(ttsharedir)
-        mlir_opt_path = _get_llvm_bin_path("mlir-opt")
-
-        def tileAndVectorize():
-            sequence = transform.NamedSequenceOp(
-                "__tile_and_vectorize",
-                [transform.OperationType.get("func.func")],
-                [],
-                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
-            )
-            with InsertionPoint(sequence.body):
-                # Step 0: Get a handle to the matmul op
-                matmuls = structured.MatchOp.match_op_names(
-                    sequence.bodyTarget,
-                    ["linalg.matmul"] 
-                )
-                
-                # Step 1: Tile
-                tiled = structured.TileUsingForOp(matmuls.result, sizes=[2,[4],1])
-
-                # Step 2: Vectorize
-                structured.VectorizeOp(tiled.results[0], [2, [4], 1])
-                
-                # Step 3: Lower vector.multi_reduction to vector.contract (+ some helpful patterns)
-                with InsertionPoint(transform.ApplyPatternsOp(sequence.bodyTarget).patterns):
-                    vector.ApplyVectorReductionToContractPatternsOp()
-                    vector.ApplyTransferPermutationPatternsOp()
-                    vector.ApplyLowerMaskedTransfersPatternsOp()
-                    # vector.ApplySinkVectorPatternsOp() # not available in LLVM 19
-
-                with InsertionPoint(transform.ApplyPatternsOp(sequence.bodyTarget).patterns):
-                    vector.ApplyLowerContractionPatternsOp(lowering_strategy=vector.VectorContractLowering.OuterProduct)
-                    vector.ApplyLowerOuterProductPatternsOp()
-                    
-                transform.YieldOp([])
-
-        def opt():
-            sequence = transform.NamedSequenceOp(
-                "opt",
-                [transform.OperationType.get("func.func")],
-                [],
-                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
-            )
-
-            with InsertionPoint(sequence.body):
-
-                transform.apply_cse(
-                    sequence.bodyTarget,)
-
-                c = transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    sequence.bodyTarget,
-                    "canonicalize",)
-                
-                s = transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    c.result,
-                    "convert-vector-to-scf",)
-                
-                l = transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    s.result,
-                    "convert-linalg-to-loops",
-                )
-                
-                sve = transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    l.result,
-                    "arm-sve-legalize-vector-storage",
-                )
-
-                transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    sve.result,
-                    "convert-vector-to-llvm",
-                    options='enable-arm-sve',
-                )
-                
-                transform.YieldOp([])
-
-        def transform_main():
-            sequence = transform.NamedSequenceOp(
-                "__transform_main",
-                [transform.AnyOpType.get()],
-                [],
-                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
-            )
-            
-            with InsertionPoint(sequence.body):
-                
-                buff = bufferization.OneShotBufferizeOp(sequence.bodyTarget, bufferize_function_boundaries= True)
-                
-                # get all the functions
-                funcs = structured.MatchOp.match_op_names(
-                    transform.OperationType.get("func.func"),
-                    buff.result,
-                    ["func.func"]
-                )
-                ## for each
-                foreach = transform.ForeachOp(
-                    [],
-                    funcs,
-                )
-                
-                foreachBody = foreach.body.blocks.append(transform.OperationType.get("func.func"))
-                
-                with InsertionPoint(foreachBody):
-                    # tile and vectorize
-                    x = transform.IncludeOp(
-                        [],
-                        FlatSymbolRefAttr.get("__tile_and_vectorize"),
-                        transform.FailurePropagationMode.Propagate,
-                        [foreachBody.arguments[0]],
-                    )
-
-                    transform.IncludeOp(
-                        [],
-                        FlatSymbolRefAttr.get("opt"),
-                        transform.FailurePropagationMode.Propagate,
-                        [foreachBody.arguments[0]],
-                    )
-
-                    transform.YieldOp([])
-
-                transform.YieldOp([])
-                 
-        with Context() as ctx, Location.file (ttshared_path, line=0, col=0, context=ctx):
-            ctx.allow_unregistered_dialects = True
-            ctx.load_all_available_dialects()
-            ctx.enable_multithreading = False
-            mod = Module.create()
-            ## add attributes to the module
-            mod.operation.attributes["transform.with_named_sequence"] = UnitAttr.get()
-        
-            with InsertionPoint(mod.body):
-                tileAndVectorize()
-                opt()
-                transform_main()
-
-            ## write mod back to file
-            with open(ttshared_path, 'a') as f:
-                print(mod, file=f)
-        
-        _dump_ir_if_needed([ttshared_path])
-        # TritonShared-MLIR to LLVM-MLIR
-        subprocess.check_call([mlir_opt_path, ttshared_path,
-            "--transform-interpreter",
-            "--test-transform-dialect-erase-schedule",
-            '--convert-vector-to-llvm="enable-arm-sve"',
-            "--convert-linalg-to-loops",
-            "--test-lower-to-llvm",
-            "-o",
-            llmlir_path])
-
-        extract_mlir_function(llmlir_path)
-        _dump_ir_if_needed([llmlir_path])
-        # LLVM-MLIR to LLVM-IR
-        mlir_translate_path = _get_llvm_bin_path("mlir-translate")
-        subprocess.check_call([mlir_translate_path, llmlir_path,
-            "--mlir-to-llvmir",
-            "-o",
-            llir_path])
-        _dump_ir_if_needed([llir_path])
-        return Path(llir_path).read_text()
-
-
-def _optimize_llir(llir: str):
-    # We don't apply any optimizations now, but we can add passes if needed.
-    return llir
-
-
-def _llir_to_bin(llir: str, metadata):
-    pattern = r"define void @(\w+)\(.+"
-    matches = re.findall(pattern, llir)
-    assert len(matches) == 1
-    metadata["name"] = matches[0]
-    with tempfile.TemporaryDirectory() as tmpdir:
-        src_path = os.path.join(tmpdir, "kernel.ll")
-        dst_path = os.path.join(tmpdir, "kernel.o")
-        Path(src_path).write_text(llir)
-        llc_path = _get_llvm_bin_path("llc")
-        subprocess.check_call([llc_path, src_path, "-filetype=obj", "-o", dst_path])
-        return Path(dst_path).read_bytes()
 
 
 
@@ -340,6 +80,8 @@ class CPUBackend(BaseBackend):
 
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
+        self.cpu_features = llvm.get_cpu_features()
+        self.cpu_arch = llvm.get_cpu_tripple().split("-")[0]
 
     def parse_options(self, opts) -> Any:
         args = {'arch': self.target.arch}
@@ -383,11 +125,400 @@ class CPUBackend(BaseBackend):
         pm.run(mod)
         return mod
 
+    def _ttir_to_ttsharedir(self, mod):
+        # Get Triton-MLIR as string
+        ttir_code = str(mod)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_path = os.path.join(tmpdir, "tt.mlir")
+            dst_path = os.path.join(tmpdir, "ttshared.mlir")
+            Path(src_path).write_text(ttir_code)
+            _dump_ir_if_needed([src_path])
+            triton_shared_opt_path = _get_triton_shared_opt_path()
+            subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "-o", dst_path])
+            return Path(dst_path).read_text()
+
+
+
+    def _sve_transform(self, src: str) -> str:
+        ## Transform needed for SVE (as seen in the official MLIR example)
+        def tileAndVectorize():
+            sequence = transform.NamedSequenceOp(
+                "__tile_and_vectorize",
+                [transform.OperationType.get("func.func")],
+                [],
+                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
+            )
+            with InsertionPoint(sequence.body):
+                # Step 0: Get a handle to the matmul op
+                matmuls = structured.MatchOp.match_op_names(
+                    sequence.bodyTarget,
+                    ["linalg.matmul"] 
+                )
+                    
+                # Step 1: Tile
+                tiled = structured.TileUsingForOp(matmuls.result, sizes=[2,[4],1])
+
+                # Step 2: Vectorize
+                structured.VectorizeOp(tiled.results[0], [2, [4], 1])
+                    
+                # Step 3: Lower vector.multi_reduction to vector.contract (+ some helpful patterns)
+                with InsertionPoint(transform.ApplyPatternsOp(sequence.bodyTarget).patterns):
+                    vector.ApplyVectorReductionToContractPatternsOp()
+                    vector.ApplyTransferPermutationPatternsOp()
+                    vector.ApplyLowerMaskedTransfersPatternsOp()
+                    # vector.ApplySinkVectorPatternsOp() # not available in LLVM 19
+
+                with InsertionPoint(transform.ApplyPatternsOp(sequence.bodyTarget).patterns):
+                    vector.ApplyLowerContractionPatternsOp(lowering_strategy=vector.VectorContractLowering.OuterProduct)
+                    vector.ApplyLowerOuterProductPatternsOp()
+                        
+                transform.YieldOp([])
+
+        ## instead of using mlir-opt we embed the optimization passes in the transform dialect 
+        def opt():
+            sequence = transform.NamedSequenceOp(
+                "opt",
+                [transform.OperationType.get("func.func")],
+                [],
+                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
+            )
+
+            with InsertionPoint(sequence.body):
+
+                transform.apply_cse(
+                    sequence.bodyTarget,)
+
+                c = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    sequence.bodyTarget,
+                    "canonicalize",)
+                    
+                s = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    c.result,
+                    "convert-vector-to-scf",)
+                    
+                l = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    s.result,
+                    "convert-linalg-to-loops",
+                )
+                    
+                sve = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    l.result,
+                    "arm-sve-legalize-vector-storage",
+                )
+
+                transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    sve.result,
+                    "convert-vector-to-llvm",
+                    options='enable-arm-sve',
+                )
+                    
+                transform.YieldOp([])
+
+        def transform_main():
+            sequence = transform.NamedSequenceOp(
+                "__transform_main",
+                [transform.AnyOpType.get()],
+                [],
+                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
+            )
+                
+            with InsertionPoint(sequence.body):
+                    
+                buff = bufferization.OneShotBufferizeOp(sequence.bodyTarget, bufferize_function_boundaries= True)
+                    
+                # get all the functions
+                funcs = structured.MatchOp.match_op_names(
+                    transform.OperationType.get("func.func"),
+                    buff.result,
+                    ["func.func"]
+                )
+                ## for each
+                foreach = transform.ForeachOp(
+                    [],
+                    funcs,
+                )
+                    
+                foreachBody = foreach.body.blocks.append(transform.OperationType.get("func.func"))
+                    
+                with InsertionPoint(foreachBody):
+                    # tile and vectorize
+                    x = transform.IncludeOp(
+                        [],
+                        FlatSymbolRefAttr.get("__tile_and_vectorize"),
+                        transform.FailurePropagationMode.Propagate,
+                        [foreachBody.arguments[0]],
+                    )
+                    # optimize
+                    transform.IncludeOp(
+                        [],
+                        FlatSymbolRefAttr.get("opt"),
+                        transform.FailurePropagationMode.Propagate,
+                        [foreachBody.arguments[0]],
+                    )
+
+                    transform.YieldOp([])
+
+                transform.YieldOp([])
+                     
+        with Context() as ctx, Location.unknown():
+            mod = Module.create()
+            ## add attributes to the module
+            mod.operation.attributes["transform.with_named_sequence"] = UnitAttr.get()
+            
+            with InsertionPoint(mod.body):
+                tileAndVectorize()
+                opt()
+                transform_main()
+
+            ## Append our transform to the original source
+            return src + "\n" + str(mod)
+
+
+    def _sme_transform(self, src: str) -> str:
+
+         def transform_main():
+            sequence = transform.NamedSequenceOp(
+                "__transform_main",
+                [transform.AnyOpType.get()],
+                [],
+                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
+            )
+                
+            with InsertionPoint(sequence.body):
+
+                ## get matmul
+                matmuls = structured.MatchOp.match_op_names(
+                    sequence.bodyTarget,
+                    ["linalg.matmul"]
+                )
+                
+                # Step 1: Tile for size [4] x [4], which corresponds to SVLs x SVLs, where
+                # SVLs is the number of 32-bit elements in a vector of SVL bits.
+                tiled = structured.TileUsingForOp(matmuls.result, sizes=[[4],[4],1])
+                # Step 2: Vectorize.
+                structured.VectorizeOp(tiled.results[0], [[4], [4], 1])
+                # Step 3: Bufferize ahead of TransferReadDropUnitDimsPattern, which
+                # currently only supports memrefs.
+                buff = bufferization.OneShotBufferizeOp(
+                    sequence.bodyTarget, bufferize_function_boundaries=True)
+                ## get the funcs
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    buff.result,
+                    ["func.func"]
+                )
+
+                # Step 4: Lower vector.multi_reduction to vector.contract (+ some helpful patterns).
+                with InsertionPoint(transform.ApplyPatternsOp(funcs).patterns):
+                    vector.ApplyLowerMaskedTransfersPatternsOp()
+                    vector.ApplyTransferPermutationPatternsOp()
+                    vector.ApplyVectorReductionToContractPatternsOp()
+
+                # Step 5: Lower vector.contract to vector.outerproduct. Also drop unit
+                # dims, specifically to prevent vector.transfer_read of vector<[4]x1xf32>,
+                # which can't be lowered in generic path.
+                with InsertionPoint(transform.ApplyPatternsOp(funcs).patterns):
+                    vector.ApplyLowerContractionPatternsOp(lowering_strategy=vector.VectorContractLowering.OuterProduct)
+                    vector.ApplyLowerMasksPatternsOp()
+                    vector.ApplyRankReducingSubviewPatternsOp()
+                    transform.ApplyCanonicalizationPatternsOp()
+
+                # Step 6 (optional optimization): Hoist accumulator load/store.
+                func_h = structured.HoistRedundantVectorTransfersOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                )
+
+                all_loops = structured.MatchOp.__base__(
+                    transform.AnyOpType.get(),
+                    buff.result,
+                    interface=structured.MatchInterfaceEnum.LoopLikeInterface
+                )
+
+                transform.apply_licm(
+                    all_loops.result,
+                )
+
+                loop.loop_hoist_loop_invariant_subsets(
+                    all_loops.result,
+                )
+                
+                transform.YieldOp([])
+ 
+                    
+        
+         with Context() as ctx, Location.unknown():
+            mod = Module.create()
+            ## add attributes to the module
+            mod.operation.attributes["transform.with_named_sequence"] = UnitAttr.get()
+            
+            with InsertionPoint(mod.body):
+                transform_main()
+
+            ## Append our transform to the original source
+            return src + "\n" + str(mod)
+
+       
+
+    def _optimize_ttsharedir(self, src: str):
+        if(self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
+            return self._sme_transform(src)
+        elif (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
+            return self._sve_transform(src)
+
+
+        return src
+
+    def _extract_mlir_function(self, filepath: str) -> None:
+        """
+        Reads an MLIR source file, retains external llvm.func declarations and
+        extracts the first llvm.func definition with a body, then overwrites the file
+        with these declarations followed by the function body.
+
+        Args:
+            filepath: Path to the MLIR source file to process.
+        """
+        with open(filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        decl_pattern = re.compile(r"^\s*llvm\.func\b.*\)(?:\s*->.*)?\s*$")
+        body_start_pattern = re.compile(r"^\s*llvm\.func\b.*\{")
+
+        decl_lines = []
+        body_lines = []
+        in_body = False
+        brace_balance = 0
+
+        for line in lines:
+            if not in_body:
+                # Collect external declarations (no body)
+                if decl_pattern.match(line) and not body_start_pattern.search(line):
+                    decl_lines.append(line)
+                    continue
+                # Detect start of first function with body
+                if body_start_pattern.search(line):
+                    in_body = True
+                    brace_balance = line.count('{') - line.count('}')
+                    body_lines.append(line)
+                    continue
+            else:
+                body_lines.append(line)
+                brace_balance += line.count('{') - line.count('}')
+                if brace_balance == 0:
+                    break
+
+        if not body_lines:
+            return
+
+        # Dedent the function body block
+        dedented_body = textwrap.dedent(''.join(body_lines)).strip() + '\n'
+
+        # Combine declarations and body
+        output = ''.join(decl_lines).strip()
+        if decl_lines:
+            output += '\n\n'
+        output += dedented_body
+
+        # Overwrite file
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(output)
+
+
+    def _ttsharedir_to_llir(self, ttsharedir: str):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ttshared_path = os.path.join(tmpdir, "ttshared.mlir")
+            llmlir_path = os.path.join(tmpdir, "ll.mlir")
+            llir_path = os.path.join(tmpdir, "ll.ir")
+            Path(ttshared_path).write_text(ttsharedir)
+            mlir_opt_path = _get_llvm_bin_path("mlir-opt")
+
+            if self.cpu_arch == "aarch64" and "sme" in self.cpu_features:
+                pipeline = [
+                "--transform-interpreter",
+                "--test-transform-dialect-erase-schedule",
+                "--convert-linalg-to-loops",
+                "--test-lower-to-arm-sme",
+                "--test-lower-to-llvm",
+                ]
+            elif self.cpu_arch == "aarch64" and "sve" in self.cpu_features:
+                pipeline = [
+                "--transform-interpreter",
+                "--test-transform-dialect-erase-schedule",
+                "--convert-vector-to-llvm=\"enable-arm-sve\"",
+                "--convert-linalg-to-loops",
+                "--test-lower-to-llvm",
+                ]
+            else:
+                pipeline = [
+                "--convert-linalg-to-affine-loops",
+                "--empty-tensor-to-alloc-tensor",
+                "--one-shot-bufferize=allow-return-allocs-from-loops=true",
+                "--lower-affine",
+                "--convert-linalg-to-loops",
+                "--expand-strided-metadata",
+                "--convert-scf-to-cf",
+                "--test-lower-to-llvm",
+                "--reconcile-unrealized-casts",
+                ]
+           
+            _dump_ir_if_needed([ttshared_path])
+            # TritonShared-MLIR to LLVM-MLIR
+            subprocess.check_call([mlir_opt_path, ttshared_path] + pipeline + [ "-o", llmlir_path])
+
+            self._extract_mlir_function(llmlir_path)
+            _dump_ir_if_needed([llmlir_path])
+            # LLVM-MLIR to LLVM-IR
+            mlir_translate_path = _get_llvm_bin_path("mlir-translate")
+            subprocess.check_call([mlir_translate_path, llmlir_path,
+                "--mlir-to-llvmir",
+                "-o",
+                llir_path])
+            _dump_ir_if_needed([llir_path])
+            return Path(llir_path).read_text()
+
+
+    def _optimize_llir(self, llir: str):
+        # We don't apply any optimizations now, but we can add passes if needed.
+        return llir
+
+
+    def _llir_to_bin(self, llir: str, metadata):
+        pattern = r"define void @(\w+)\(.+"
+        matches = re.findall(pattern, llir)
+        assert len(matches) == 1
+        metadata["name"] = matches[0]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_path = os.path.join(tmpdir, "kernel.ll")
+            dst_path = os.path.join(tmpdir, "kernel.o")
+            Path(src_path).write_text(llir)
+            llc_path = _get_llvm_bin_path("llc")
+            flags = ""
+            if self.cpu_arch == "aarch64" and "sme" in self.cpu_features:
+                flags = (
+                    "-mtriple=aarch64-linux-gnu",
+                    "-mattr=+sve",
+                )
+            elif self.cpu_arch == "aarch64" and "sve" in self.cpu_features:
+                flags = (
+                    "-mtriple=aarch64-linux-gnu",
+                    "-mattr=+sve",
+                )
+            
+            subprocess.check_call([llc_path, src_path, "-filetype=obj", "-o", dst_path] + list(flags))
+            return Path(dst_path).read_bytes()
+
+
+
     def add_stages(self, stages, options):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
-        stages["ttsharedir"] = lambda src, metadata: _optimize_ttsharedir(_ttir_to_ttsharedir(src))
-        stages["llir"] = lambda src, metadata: _optimize_llir(_ttsharedir_to_llir(src))
-        stages["obj"] = lambda src, metadata: _llir_to_bin(src, metadata)
+        stages["ttsharedir"] = lambda src, metadata: self._optimize_ttsharedir(self._ttir_to_ttsharedir(src))
+        stages["llir"] = lambda src, metadata: self._optimize_llir(self._ttsharedir_to_llir(src))
+        stages["obj"] = lambda src, metadata: self._llir_to_bin(src, metadata)
 
 
     @functools.lru_cache()
