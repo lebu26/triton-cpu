@@ -13,6 +13,7 @@ from pathlib import Path
 from triton.runtime.cache import get_cache_manager
 from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
+import shutil
 
 # -------------------- Launcher ----------------------------
 def _ty_to_cpp(ty):
@@ -76,11 +77,15 @@ def _generate_launcher(constants, signature, kernel_name):
     kernel_parameters += ', ' if kernel_parameters else ''
 
     return f"""
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <assert.h>
 #include <stdbool.h>
 #include <Python.h>
 #include "ExecutionEngine/CRunnerUtils.h"
 #include "ExecutionEngine/CRunnerUtils.cpp"
+#include <iostream>
 
 extern "C" {{
   // Pointer type (=Memref) becomes int64_t + MemRef struct
@@ -89,19 +94,25 @@ extern "C" {{
                        int, int, int, int, int, int);
 }}
 
-static void _launch(int gridX, int gridY, int gridZ, {arg_decls}) {{
-  if (gridX*gridY*gridZ > 0) {{
-    // Cast "function" to the real function type.
-    for(int x = 0; x < gridX; x++) {{
-      for(int y = 0; y < gridY; y++) {{
-        for(int z = 0; z < gridZ; z++) {{
-          // Use some random type "char" here.
-          {' '.join(f'StridedMemRefType<char, 0> ptr_arg{i} = {{static_cast<char *>(arg{i}), static_cast<char *>(arg{i}), 0}};' for i, ty in signature.items() if i not in constants and ty[0] == "*")}
-          {kernel_name}({kernel_parameters}
-                        gridX, gridY, gridZ, x, y, z);
-        }}
-      }}
-    }}
+static void _launch(int gridX, int gridY, int gridZ, int num_threads, {arg_decls}) {{
+int64_t N = (int64_t)gridX * gridY * gridZ;
+
+#ifdef _OPENMP
+int max_threads = (num_threads > 0) ? num_threads : omp_get_max_threads();
+
+#pragma omp parallel for schedule(static) num_threads(max_threads)
+#endif
+for (int64_t i = 0; i < N; ++i) {{
+  int x = i % gridX;
+  int y = (i / gridX) % gridY;
+  int z = i / (gridX * gridY);
+
+
+  // Optional: declare memrefs like before
+  {' '.join(f'StridedMemRefType<char, 0> ptr_arg{i} = {{static_cast<char *>(arg{i}), static_cast<char *>(arg{i}), 0}};' for i, ty in signature.items() if i not in constants and ty[0] == "*")}
+
+  {kernel_name}({kernel_parameters}
+                gridX, gridY, gridZ, x, y, z);
   }}
 }}
 
@@ -156,6 +167,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
     return NULL;
   }}
 
+
   // [CPULauncher-specific]: We don't need the metadata below but just put them
   // here anyway to be consistent with others.
   // This will make updating the driver easier in the future.
@@ -166,6 +178,21 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   //    return NULL;
   //  }}
 
+  
+  int num_threads = 0;
+  if (kernel_metadata && kernel_metadata != Py_None) {{
+    PyObject *num_threads_attr = PyObject_GetAttrString(kernel_metadata, "num_threads");
+    if (num_threads_attr) {{
+      if (PyLong_Check(num_threads_attr))
+        num_threads = PyLong_AsLong(num_threads_attr);
+      Py_DECREF(num_threads_attr);
+    }} else {{
+      PyErr_Clear(); // Avoid leaving a lingering Python exception
+    }}
+  }}
+  
+  
+  
   // extract launch metadata
   if (launch_enter_hook != Py_None){{
     PyObject* args = Py_BuildValue("(O)", launch_metadata);
@@ -175,9 +202,10 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
       return NULL;
   }}
 
+
   // raise exception asap
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
-  _launch(gridX, gridY, gridZ, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
+  _launch(gridX, gridY, gridZ, num_threads, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
 
   if (PyErr_Occurred()) {{
     return NULL;
@@ -275,10 +303,14 @@ def compile_module(launcher_src, kernel_placeholder_name):
                   Path(obj_path).write_bytes(kernel_obj)
                   Path(launcher_src_path).write_text(src)
                   # Compile it together.
+                  ## dump main.cxx to dir in TRITON_SHARED_DUMP_PATH
+                  if "TRITON_SHARED_DUMP_PATH" in os.environ:
+                    dump_path = os.environ["TRITON_SHARED_DUMP_PATH"]
+                    shutil.copy(launcher_src_path, dump_path)
                   subprocess.check_call([
-                    "g++", "-std=c++17", launcher_src_path, obj_path,
+                    "g++","-g", "-std=c++17", launcher_src_path, obj_path,
                     f"-I{py_include_dir}", f"-I{include_dir}", f"-L{py_lib_dir}",
-                    "-shared", f"-l{py_lib}", "-fPIC", "-o", so_path
+                    "-shared", f"-l{py_lib}", "-fPIC", "-fopenmp", "-o", so_path
                   ])
 
               with open(so_path, "rb") as f:

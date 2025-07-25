@@ -314,7 +314,7 @@ class CPUBackend(BaseBackend):
                 )
 
                 # Step 4: Lower vector.multi_reduction to vector.contract (+ some helpful patterns).
-                with InsertionPoint(transform.ApplyPatternsOp(funcs).patterns):
+                with InsertionPoint(transform.ApplyPatternsOp(l).patterns):
                     vector.ApplyLowerMaskedTransfersPatternsOp()
                     vector.ApplyTransferPermutationPatternsOp()
                     vector.ApplyVectorReductionToContractPatternsOp()
@@ -322,11 +322,12 @@ class CPUBackend(BaseBackend):
                 # Step 5: Lower vector.contract to vector.outerproduct. Also drop unit
                 # dims, specifically to prevent vector.transfer_read of vector<[4]x1xf32>,
                 # which can't be lowered in generic path.
-                with InsertionPoint(transform.ApplyPatternsOp(funcs).patterns):
+                with InsertionPoint(transform.ApplyPatternsOp(l).patterns):
                     vector.ApplyLowerContractionPatternsOp(lowering_strategy=vector.VectorContractLowering.OuterProduct)
                     vector.ApplyLowerMasksPatternsOp()
                     vector.ApplyRankReducingSubviewPatternsOp()
                     transform.ApplyCanonicalizationPatternsOp()
+
 
                 # Step 6 (optional optimization): Hoist accumulator load/store.
                 func_h = structured.HoistRedundantVectorTransfersOp(
@@ -347,7 +348,35 @@ class CPUBackend(BaseBackend):
                 loop.loop_hoist_loop_invariant_subsets(
                     all_loops.result,
                 )
+
+                '''
+                ## general opts
+
+                l = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    func_h.result,
+                    "convert-linalg-to-loops",
+                )
                 
+                s = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    l.result,
+                    "test-lower-to-arm-sme",
+                )
+                
+                x = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    s.result,
+                    "convert-arm-sme-to-llvm",
+                )
+
+                transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    x.result,
+                    "test-lower-to-llvm",
+                )
+
+               ''' 
                 transform.YieldOp([])
  
                     
