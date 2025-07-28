@@ -281,11 +281,11 @@ class CPUBackend(BaseBackend):
 
     def _sme_transform(self, src: str) -> str:
 
-         def transform_main():
+        def step1():
             sequence = transform.NamedSequenceOp(
-                "__transform_main",
+                "__step1",
                 [transform.AnyOpType.get()],
-                [],
+                [transform.AnyOpType.get()],
                 arg_attrs = [{"transform.consumed": UnitAttr.get()}],
             )
                 
@@ -313,6 +313,12 @@ class CPUBackend(BaseBackend):
                     ["func.func"]
                 )
 
+                l = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    funcs.result,
+                    "convert-linalg-to-loops",
+                )
+
                 # Step 4: Lower vector.multi_reduction to vector.contract (+ some helpful patterns).
                 with InsertionPoint(transform.ApplyPatternsOp(l).patterns):
                     vector.ApplyLowerMaskedTransfersPatternsOp()
@@ -323,17 +329,11 @@ class CPUBackend(BaseBackend):
                 # dims, specifically to prevent vector.transfer_read of vector<[4]x1xf32>,
                 # which can't be lowered in generic path.
                 with InsertionPoint(transform.ApplyPatternsOp(l).patterns):
+                    vector.ApplyCastAwayVectorLeadingOneDimPatternsOp()
+                    tensor.ApplyFoldTensorSubsetOpsIntoVectorTransfersPatternsOp()
                     vector.ApplyLowerContractionPatternsOp(lowering_strategy=vector.VectorContractLowering.OuterProduct)
                     vector.ApplyLowerMasksPatternsOp()
-                    vector.ApplyRankReducingSubviewPatternsOp()
                     transform.ApplyCanonicalizationPatternsOp()
-
-
-                # Step 6 (optional optimization): Hoist accumulator load/store.
-                func_h = structured.HoistRedundantVectorTransfersOp(
-                    transform.AnyOpType.get(),
-                    funcs.result,
-                )
 
                 all_loops = structured.MatchOp.__base__(
                     transform.AnyOpType.get(),
@@ -349,44 +349,156 @@ class CPUBackend(BaseBackend):
                     all_loops.result,
                 )
 
-                '''
-                ## general opts
+                transform.YieldOp([buff.result])
+ 
+        def arm_sme_lowering_schedule():
+            sequence = transform.NamedSequenceOp(
+                "__arm_sme_lowering_schedule",
+                [transform.AnyOpType.get()],
+                [transform.AnyOpType.get()],
+                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
+            )
+            with InsertionPoint(sequence.body):
+                result = transform.lower_to_arm_sme(
+                    sequence.bodyTarget,
+                )
+                transform.YieldOp([sequence.bodyTarget])
 
-                l = transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    func_h.result,
-                    "convert-linalg-to-loops",
+        def lower_to_llvm():
+            sequence = transform.NamedSequenceOp(
+                "__lower_to_llvm",
+                [transform.AnyOpType.get()],
+                [transform.AnyOpType.get()],
+                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
+            )
+            with InsertionPoint(sequence.body):
+                result = transform.lower_to_llvm_new(
+                    sequence.bodyTarget,
+                    enable_arm_sve=True,
+                    enable_index_optimizations=True,
+                    vscale_range=0,
+                )
+                transform.YieldOp([sequence.bodyTarget])
+                    
+        def step2(include, name):
+            sequence = transform.NamedSequenceOp(
+                "__step2_" + name,
+                [transform.AnyOpType.get()],
+                [],
+                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
+            )
+            with InsertionPoint(sequence.body):
+                ## get all funcs
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    sequence.bodyTarget,
+                    ["func.func"]
+                )
+                ## get parent op
+                p = transform.get_parent_op(
+                    transform.AnyOpType.get(),
+                    funcs.result, 
+                    deduplicate=True,
+                )
+                ## include
+                sme = transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    include,
+                    transform.FailurePropagationMode.Propagate,
+                    [p],
                 )
                 
-                s = transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    l.result,
-                    "test-lower-to-arm-sme",
-                )
-                
-                x = transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    s.result,
-                    "convert-arm-sme-to-llvm",
+                ## cse
+                cse = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    sme.result,
+                    "cse",
                 )
 
+                with InsertionPoint(transform.ApplyPatternsOp(cse).patterns):
+                    structured.apply_patterns_linalg_tiling_canonicalization()
+                    loop.apply_patterns_scf_for_loop_canonicalization()
+                
+                ## match looplike
+                looplike = structured.MatchOp.__base__(
+                    transform.AnyOpType.get(),
+                    cse.result,
+                    interface=structured.MatchInterfaceEnum.LoopLikeInterface
+                )
+                ## apply licm
+                transform.apply_licm(
+                    looplike.result,
+                )
+                ## match func from cse
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    cse.result,
+                    ["func.func"]
+                )
+                ## hoist redudant vector transfers
+                a = transform.structured.HoistRedundantVectorTransfersOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                )
+                ## hoist redundant vector broadcasts
+                b = transform.structured.HoistRedundantVectorBroadcastsOp(
+                    transform.AnyOpType.get(),
+                    a.result,
+                )
+                ## canonicalize
                 transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
-                    x.result,
-                    "test-lower-to-llvm",
+                    b.result,
+                    "canonicalize",
                 )
 
-               ''' 
                 transform.YieldOp([])
- 
-                    
         
-         with Context() as ctx, Location.unknown():
+        def transform_main():
+            sequence = transform.NamedSequenceOp(
+                "__transform_main",
+                [transform.AnyOpType.get()],
+                [],
+                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
+            )
+            with InsertionPoint(sequence.body):
+                ## include step 1
+                first = transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    FlatSymbolRefAttr.get("__step1"),
+                    transform.FailurePropagationMode.Propagate,
+                    [sequence.bodyTarget],
+                )
+                ## include step 2 sme
+                transform.IncludeOp(
+                    [],
+                    FlatSymbolRefAttr.get("__step2_sme"),
+                    transform.FailurePropagationMode.Propagate,
+                    [first],
+                )
+
+                ## include step 2 llvm
+                transform.IncludeOp(
+                    [],
+                    FlatSymbolRefAttr.get("__step2_llvm"),
+                    transform.FailurePropagationMode.Propagate,
+                    [first],
+                )
+
+                transform.YieldOp([])
+        
+        
+        with Context() as ctx, Location.unknown():
             mod = Module.create()
             ## add attributes to the module
             mod.operation.attributes["transform.with_named_sequence"] = UnitAttr.get()
             
             with InsertionPoint(mod.body):
+                step1()
+                arm_sme_lowering_schedule()
+                lower_to_llvm()
+                step2(FlatSymbolRefAttr.get("__arm_sme_lowering_schedule"), "sme")
+                step2(FlatSymbolRefAttr.get("__lower_to_llvm"), "llvm")
                 transform_main()
 
             ## Append our transform to the original source
@@ -426,7 +538,7 @@ class CPUBackend(BaseBackend):
         for line in lines:
             if not in_body:
                 # Collect external declarations (no body)
-                if decl_pattern.match(line) and not body_start_pattern.search(line):
+                if decl_pattern.match(line):
                     decl_lines.append(line)
                     continue
                 # Detect start of first function with body
@@ -470,9 +582,7 @@ class CPUBackend(BaseBackend):
                 pipeline = [
                 "--transform-interpreter",
                 "--test-transform-dialect-erase-schedule",
-                "--convert-linalg-to-loops",
-                "--test-lower-to-arm-sme",
-                "--test-lower-to-llvm",
+                "--arm-sme-vector-legalization" ## to avoid crash due to unloaded dialect
                 ]
             elif self.cpu_arch == "aarch64" and "sve" in self.cpu_features:
                 pipeline = [
@@ -499,8 +609,8 @@ class CPUBackend(BaseBackend):
             # TritonShared-MLIR to LLVM-MLIR
             subprocess.check_call([mlir_opt_path, ttshared_path] + pipeline + [ "-o", llmlir_path])
 
-            self._extract_mlir_function(llmlir_path)
             _dump_ir_if_needed([llmlir_path])
+            self._extract_mlir_function(llmlir_path)
             # LLVM-MLIR to LLVM-IR
             mlir_translate_path = _get_llvm_bin_path("mlir-translate")
             subprocess.check_call([mlir_translate_path, llmlir_path,
@@ -530,7 +640,7 @@ class CPUBackend(BaseBackend):
             if self.cpu_arch == "aarch64" and "sme" in self.cpu_features:
                 flags = (
                     "-mtriple=aarch64-linux-gnu",
-                    "-mattr=+sve",
+                    "-mattr=+sme",
                 )
             elif self.cpu_arch == "aarch64" and "sve" in self.cpu_features:
                 flags = (
