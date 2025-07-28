@@ -16,7 +16,7 @@ from pdb import set_trace as st
 from mlir.ir import *
 from mlir.dialects import transform
 from mlir.dialects.transform import pdl as transform_pdl
-from mlir.dialects.transform import structured, loop, vector, bufferization
+from mlir.dialects.transform import structured, loop, vector, bufferization, tensor
 
 
 def _get_triton_shared_opt_path() -> str:
@@ -507,7 +507,8 @@ class CPUBackend(BaseBackend):
        
 
     def _optimize_ttsharedir(self, src: str):
-        if(self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
+        if True:
+        #if(self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
             return self._sme_transform(src)
         elif (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
             return self._sve_transform(src)
@@ -578,11 +579,11 @@ class CPUBackend(BaseBackend):
             Path(ttshared_path).write_text(ttsharedir)
             mlir_opt_path = _get_llvm_bin_path("mlir-opt")
 
-            if self.cpu_arch == "aarch64" and "sme" in self.cpu_features:
+            if True:
+            #if self.cpu_arch == "aarch64" and "sme" in self.cpu_features:
                 pipeline = [
                 "--transform-interpreter",
                 "--test-transform-dialect-erase-schedule",
-                "--arm-sme-vector-legalization" ## to avoid crash due to unloaded dialect
                 ]
             elif self.cpu_arch == "aarch64" and "sve" in self.cpu_features:
                 pipeline = [
