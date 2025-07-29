@@ -18,6 +18,9 @@ from mlir.dialects import transform
 from mlir.dialects.transform import pdl as transform_pdl
 from mlir.dialects.transform import structured, loop, vector, bufferization, tensor
 
+## Use SME/SVE even if the CPU does not support it. Will result in a crash but will generate the binary
+FORCE_SME = False
+FORCE_SVE = False
 
 def _get_triton_shared_opt_path() -> str:
     path = os.getenv("TRITON_SHARED_OPT_PATH", "")
@@ -507,10 +510,9 @@ class CPUBackend(BaseBackend):
        
 
     def _optimize_ttsharedir(self, src: str):
-        if True:
-        #if(self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
+        if(FORCE_SME or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features)):
             return self._sme_transform(src)
-        elif (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
+        elif (FORCE_SVE or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features)):
             return self._sve_transform(src)
 
 
@@ -579,13 +581,12 @@ class CPUBackend(BaseBackend):
             Path(ttshared_path).write_text(ttsharedir)
             mlir_opt_path = _get_llvm_bin_path("mlir-opt")
 
-            if True:
-            #if self.cpu_arch == "aarch64" and "sme" in self.cpu_features:
+            if FORCE_SME or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
                 pipeline = [
                 "--transform-interpreter",
                 "--test-transform-dialect-erase-schedule",
                 ]
-            elif self.cpu_arch == "aarch64" and "sve" in self.cpu_features:
+            elif FORCE_SVE or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
                 pipeline = [
                 "--transform-interpreter",
                 "--test-transform-dialect-erase-schedule",
@@ -638,18 +639,20 @@ class CPUBackend(BaseBackend):
             Path(src_path).write_text(llir)
             llc_path = _get_llvm_bin_path("llc")
             flags = ""
-            if self.cpu_arch == "aarch64" and "sme" in self.cpu_features:
+            if FORCE_SME or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
                 flags = (
                     "-mtriple=aarch64-linux-gnu",
                     "-mattr=+sme",
                 )
-            elif self.cpu_arch == "aarch64" and "sve" in self.cpu_features:
+            elif FORCE_SVE or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
                 flags = (
                     "-mtriple=aarch64-linux-gnu",
                     "-mattr=+sve",
                 )
             
             subprocess.check_call([llc_path, src_path, "-filetype=obj", "-o", dst_path] + list(flags))
+            ## dump binary
+            _dump_ir_if_needed([dst_path])
             return Path(dst_path).read_bytes()
 
 
