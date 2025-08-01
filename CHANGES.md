@@ -57,3 +57,10 @@ Similar to SVE, a new method called `_sme_transform` was added to the `compiler.
 
 The shared backend did not support multithreading, but implementing it is fairly easy. In `driver.py`, for the C++ code, we just need to pass the number of threads as a parameter to the `_launch` function and modify that function to use OpenMP when launching the kernel calls.
 
+## Running on SVE
+
+SVE has a bug even on upstream LLVM where if the matrix is too big it will crash due to a invalid memory load/store, see the issue [here](https://github.com/llvm/llvm-project/issues/151679), The crash can be at least be alleviated with `vector-to-scf='full-unroll=true'`
+
+## Running on SME
+
+Compiling to object code required a patch in llvm provided by Chenzheng

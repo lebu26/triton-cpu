@@ -199,7 +199,8 @@ class CPUBackend(BaseBackend):
                 s = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
                     c.result,
-                    "convert-vector-to-scf",)
+                    "convert-vector-to-scf",
+                    options='full-unroll')
                     
                 l = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
