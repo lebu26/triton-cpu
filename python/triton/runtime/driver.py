@@ -5,6 +5,8 @@ from ..backends import DriverBase
 
 
 def _create_driver():
+    if os.environ.get("TRITON_USE_SHARED_BACKEND", "0") == "1":
+            return backends["triton_shared"].driver()
     if os.getenv("TRITON_CPU_BACKEND", "0") == "1":
         if "cpu" not in backends:
             raise RuntimeError("TRITON_CPU_BACKEND is set, but CPU backend is unavailable.")
