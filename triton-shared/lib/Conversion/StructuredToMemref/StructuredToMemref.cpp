@@ -466,6 +466,7 @@ private:
                                            /* strides */
                                            ValueRange{one, one});
 
+    //raise(SIGTRAP);
     rewriter.create<memref::CopyOp>(loc, block1, block1Dst);
     rewriter.create<memref::CopyOp>(loc, block2, block2Dst);
   }
@@ -501,6 +502,7 @@ private:
                                            /* strides */
                                            ValueRange{one, one});
 
+    //raise(SIGTRAP);
     rewriter.create<memref::CopyOp>(loc, block1, block1Dst);
     rewriter.create<memref::CopyOp>(loc, block2, block2Dst);
   }
@@ -595,11 +597,11 @@ private:
         llvm_unreachable("unexpected wraparound type");
       }
     } else {
-      rewriter.create<memref::CopyOp>(loc, ptr, alloc);
+      //rewriter.create<memref::CopyOp>(loc, ptr, alloc);
     }
 
     Value tensor = rewriter.create<bufferization::ToTensorOp>(
-        loc, tensorType, alloc, true /* restrict */, true /* writable */);
+        loc, tensorType, ptr, true /* restrict */, true /* writable */);
     rewriter.replaceOp(op, tensor);
 
     return success();
@@ -682,6 +684,7 @@ private:
           getSubview(tensorType.getRank(), mixedDims, ptr, loc, rewriter);
       memref::SubViewOp dstSubview =
           getSubview(tensorType.getRank(), mixedDims, alloc, loc, rewriter);
+      //raise(SIGTRAP);
       rewriter.create<memref::CopyOp>(loc, srcSubview, dstSubview);
     }
 

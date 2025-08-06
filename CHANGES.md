@@ -55,12 +55,26 @@ Similar to SVE, a new method called `_sme_transform` was added to the `compiler.
 
 ## Adding multithread support to the shared backend
 
-The shared backend did not support multithreading, but implementing it is fairly easy. In `driver.py`, for the C++ code, we just need to pass the number of threads as a parameter to the `_launch` function and modify that function to use OpenMP when launching the kernel calls.
+The shared backend did not support multithreading, but implementing it is fairly easy. In `driver.py`, for the C++ code, we just need to pass the number of threads as a parameter to the `_launch` function and modify that function to use OpenMP when launching the kernel calls. This means the kernel is launched in several threads at the same time (depending on the grid) but the kernel itself is not running with multithreading. 
 
 ## Running on SVE
 
-SVE has a bug even on upstream LLVM where if the matrix is too big it will crash due to a invalid memory load/store, see the issue [here](https://github.com/llvm/llvm-project/issues/151679), The crash can be at least be alleviated with `vector-to-scf='full-unroll=true'`
+SVE has a bug even on upstream LLVM where if the matrix is too big it will crash due to a invalid memory load/store, see the issue [here](https://github.com/llvm/llvm-project/issues/151679), The crash can be at least be alleviated with `vector-to-scf='full-unroll=true'`. To not rely on full unroll which can be unsuitable in some scenarios some hosting needs to take place during or after the `vector-to-scf` pass to remove the `allocas` from inside the loop
 
 ## Running on SME
 
-Compiling to object code required a patch in llvm provided by Chenzheng
+Compiling to object code required a patch in llvm provided by Chenzheng.
+
+## Passing test on SVE
+
+Around 60\% of test work out of the box. The failing test are manily caused by two errors:
+
+* Unsupported operations in triton shared specially some kinds of Load and Stores, see [this issue](https://github.com/microsoft/triton-shared/issues/311)
+* CPU not supporting fp8 data type
+
+these two account for almost all the failing test. 
+
+## Performance optimizations
+
+Triton shared creates unnecessary copies of memref, see [this issue](https://github.com/microsoft/triton-shared/issues/308) which introduces overhead, that can be fixed as seen in the changes to the file `StructuredToMemref.cpp` Where I commented the copy and passed the reinterpret_cast (variable named ptr in the C++ code) to `bufferization.to_tensor` instead.
+

@@ -94,7 +94,7 @@ extern "C" {{
                        int, int, int, int, int, int);
 }}
 
-static void _launch(int gridX, int gridY, int gridZ, int num_threads, {arg_decls}) {{
+static void _launch(int gridX, int gridY, int gridZ, int num_threads {', ' + arg_decls if arg_decls else ''}) {{
 int64_t N = (int64_t)gridX * gridY * gridZ;
 
 #ifdef _OPENMP
@@ -205,7 +205,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
 
   // raise exception asap
   {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature.items()])};
-  _launch(gridX, gridY, gridZ, num_threads, {', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items())});
+  _launch(gridX, gridY, gridZ, num_threads {', ' + ', '.join([f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"_arg{i}"for i, ty in signature.items()]) if signature else ""});
 
   if (PyErr_Occurred()) {{
     return NULL;

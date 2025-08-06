@@ -1,7 +1,7 @@
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton._C.libtriton import ir, passes, cpu, llvm
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 from types import ModuleType
 import hashlib
 import tempfile
@@ -55,16 +55,20 @@ class CPUOptions:
     num_ctas: int = 0
     num_stages: int = 1
     enable_warp_specialization: bool = False
-    enable_fp_fusion: bool = False
     extern_libs = None
     cluster_dims: tuple = (1, 1, 1)
     shared: bool = False
     # Disable FP8 here since this is a sample CPU backend.
     # Target specific backends can eanble it with supported types.
-    supported_fp8_dtypes: Tuple[str] = ()
-    allow_fp8e4nv: bool = False
-    allowed_dot_input_precisions: Tuple[str] = ("ieee", )
+    allowed_dot_input_precisions: Tuple[str] = ("ieee", "tf32", "tf32x3")
+    supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e5b16", "fp8e4nv")
+    allow_fp8e4nv: bool = True
+    allow_fp8e4b15: bool = True
+    enable_fp_fusion: bool = True
+    max_num_imprecise_acc_default: int = 0
+    enable_fast_math: bool = True
     sanitize_overflow: bool = True
+    vec_lib: Optional[str] = 'libsleef'
 
     def __post_init__(self):
         pass
@@ -125,6 +129,10 @@ class CPUBackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_licm(pm)
         passes.common.add_symbol_dce(pm)
+        cpu.passes.ttcpuir.add_convert_unsupported_ops(pm, False, True, True)
+        passes.common.add_cse(pm)
+        passes.common.add_symbol_dce(pm)
+        passes.common.add_canonicalizer(pm)
         pm.run(mod)
         return mod
 
@@ -195,10 +203,16 @@ class CPUBackend(BaseBackend):
                     transform.OperationType.get("func.func"),
                     sequence.bodyTarget,
                     "canonicalize",)
+
+                dealloc = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    c.result,
+                    "buffer-deallocation-pipeline",
+                )
                     
                 s = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
-                    c.result,
+                    dealloc.result,
                     "convert-vector-to-scf",
                     options='full-unroll')
                     
@@ -208,17 +222,38 @@ class CPUBackend(BaseBackend):
                     "convert-linalg-to-loops",
                 )
                     
+                '''
+                fp = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    l.result,
+                    "arith-emulate-unsupported-floats",
+                    options='source-types=f8E5M2 target-type=f32'
+                )
+                '''
+ 
                 sve = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
                     l.result,
                     "arm-sve-legalize-vector-storage",
                 )
 
-                transform.ApplyRegisteredPassOp(
+                vec = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
                     sve.result,
                     "convert-vector-to-llvm",
                     options='enable-arm-sve',
+                )
+
+                poly = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    vec.result,
+                    "test-math-polynomial-approximation",
+                )
+
+                transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    poly.result,
+                    "convert-math-to-llvm",
                 )
                     
                 transform.YieldOp([])
@@ -234,13 +269,14 @@ class CPUBackend(BaseBackend):
             with InsertionPoint(sequence.body):
                     
                 buff = bufferization.OneShotBufferizeOp(sequence.bodyTarget, bufferize_function_boundaries= True)
-                    
+
                 # get all the functions
                 funcs = structured.MatchOp.match_op_names(
                     transform.OperationType.get("func.func"),
                     buff.result,
                     ["func.func"]
                 )
+
                 ## for each
                 foreach = transform.ForeachOp(
                     [],
@@ -592,7 +628,6 @@ class CPUBackend(BaseBackend):
                 "--transform-interpreter",
                 "--test-transform-dialect-erase-schedule",
                 "--convert-vector-to-llvm=\"enable-arm-sve\"",
-                "--convert-linalg-to-loops",
                 "--test-lower-to-llvm",
                 ]
             else:
@@ -643,12 +678,12 @@ class CPUBackend(BaseBackend):
             if FORCE_SME or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
                 flags = (
                     "-mtriple=aarch64-linux-gnu",
-                    "-mattr=+sme",
+                    "-mattr=+sme,+dotprod",
                 )
             elif FORCE_SVE or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
                 flags = (
                     "-mtriple=aarch64-linux-gnu",
-                    "-mattr=+sve",
+                    "-mattr=+sve,+dotprod",
                 )
             
             subprocess.check_call([llc_path, src_path, "-filetype=obj", "-o", dst_path] + list(flags))
