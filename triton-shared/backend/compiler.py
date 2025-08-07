@@ -1,4 +1,4 @@
-from triton.backends.compiler import BaseBackend, GPUTarget
+from triton.backends.compiler import BaseBackend, GPUTarget, CPUFallbackException
 from triton._C.libtriton import ir, passes, cpu, llvm
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple, Optional
@@ -12,7 +12,6 @@ import subprocess
 import functools
 import textwrap
 from pathlib import Path
-from pdb import set_trace as st
 from mlir.ir import *
 from mlir.dialects import transform
 from mlir.dialects.transform import pdl as transform_pdl
@@ -21,6 +20,7 @@ from mlir.dialects.transform import structured, loop, vector, bufferization, ten
 ## Use SME/SVE even if the CPU does not support it. Will result in a crash but will generate the binary
 FORCE_SME = False
 FORCE_SVE = False
+ENABLE_FALLBACK = True
 
 def _get_triton_shared_opt_path() -> str:
     path = os.getenv("TRITON_SHARED_OPT_PATH", "")
@@ -145,8 +145,14 @@ class CPUBackend(BaseBackend):
             Path(src_path).write_text(ttir_code)
             _dump_ir_if_needed([src_path])
             triton_shared_opt_path = _get_triton_shared_opt_path()
-            subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "-o", dst_path])
-            return Path(dst_path).read_text()
+            try:
+                subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "-o", dst_path])
+                return Path(dst_path).read_text()
+            except subprocess.CalledProcessError as e:
+                if ENABLE_FALLBACK:
+                    print("TritonShared-MLIR optimization failed, falling back to CPU backend")
+                    os.environ["TRITON_USE_SHARED_BACKEND"] = "0"
+                    raise CPUFallbackException
 
 
 
@@ -645,7 +651,15 @@ class CPUBackend(BaseBackend):
            
             _dump_ir_if_needed([ttshared_path])
             # TritonShared-MLIR to LLVM-MLIR
-            subprocess.check_call([mlir_opt_path, ttshared_path] + pipeline + [ "-o", llmlir_path])
+
+            try:
+                subprocess.check_call([mlir_opt_path, ttshared_path] + pipeline + [ "-o", llmlir_path])
+            except subprocess.CalledProcessError as e:
+                if ENABLE_FALLBACK:
+                    print("TritonShared-MLIR optimization failed, falling back to CPU backend")
+                    os.environ["TRITON_USE_SHARED_BACKEND"] = "0"
+                    raise CPUFallbackException
+            
 
             _dump_ir_if_needed([llmlir_path])
             self._extract_mlir_function(llmlir_path)

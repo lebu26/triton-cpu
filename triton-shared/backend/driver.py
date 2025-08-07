@@ -479,7 +479,7 @@ class CPUDriver(DriverBase):
         return ("cpu", 0)
 
     def get_current_stream(self, device):
-        return None
+        return 0
 
     def get_current_device(self):
         # CPU doesn't have a device to return. Return something.
