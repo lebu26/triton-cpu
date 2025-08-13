@@ -20,7 +20,7 @@ from mlir.dialects.transform import structured, loop, vector, bufferization, ten
 ## Use SME/SVE even if the CPU does not support it. Will result in a crash but will generate the binary
 FORCE_SME = False
 FORCE_SVE = False
-ENABLE_FALLBACK = True
+ENABLE_FALLBACK = False
 
 def _get_triton_shared_opt_path() -> str:
     path = os.getenv("TRITON_SHARED_OPT_PATH", "")
@@ -228,18 +228,23 @@ class CPUBackend(BaseBackend):
                     "convert-linalg-to-loops",
                 )
                     
-                '''
                 fp = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
                     l.result,
                     "arith-emulate-unsupported-floats",
-                    options='source-types=f8E5M2 target-type=f32'
+                    options='source-types=f8E5M2,f8E4M3FN,bf16 target-type=f32'
                 )
-                '''
+
+                fp2 = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    fp.result,
+                    "arith-expand",
+                    options='include-f8e5m2=true include-bf16=true include-f8e4m3fn=true'
+                )
  
                 sve = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
-                    l.result,
+                    fp2.result,
                     "arm-sve-legalize-vector-storage",
                 )
 
