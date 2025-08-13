@@ -1233,7 +1233,7 @@ private:
                                         int64_t axis, Location loc) {
     auto rankedTy = cast<RankedTensorType>(tensor.getType());
     SmallVector<Value> idxs(rankedTy.getRank(),
-                            rewriter.create<arith::ConstantIndexOp>(loc, 0));
+                            rewriter.create<arith::ConstantIndexOp>(loc, axis));
     // Extract the first element along reduction axis
     return rewriter.create<tensor::ExtractOp>(loc, rankedTy.getElementType(),
                                               tensor, idxs);
@@ -1250,6 +1250,69 @@ private:
           return &opInner;
     }
     return nullptr;
+  }
+
+  arith::ConstantOp getRedBaseConstOp(ConversionPatternRewriter &rewriter,
+                                      Operation *redOp,
+                                      Type constantType) const {
+    const int64_t bitWidth = constantType.getIntOrFloatBitWidth();
+
+    auto attr =
+        llvm::TypeSwitch<Operation *, TypedAttr>(redOp)
+            .Case([&](arith::AddFOp) {
+              return rewriter.getFloatAttr(constantType, 0.f);
+            })
+            .Case([&](arith::AddIOp) {
+              return rewriter.getIntegerAttr(constantType, 0);
+            })
+            .Case<arith::MaximumFOp, arith::MaxNumFOp>([&](auto) {
+              return rewriter.getFloatAttr(
+                  constantType, -std::numeric_limits<float>::infinity());
+            })
+            .Case<arith::MinimumFOp, arith::MinNumFOp>([&](auto) {
+              return rewriter.getFloatAttr(
+                  constantType, std::numeric_limits<float>::infinity());
+            })
+            .Case([&](arith::MinSIOp) {
+              return rewriter.getIntegerAttr(constantType,
+                                             llvm::maxIntN(bitWidth));
+            })
+            .Case([&](arith::MinUIOp) {
+              return rewriter.getIntegerAttr(constantType,
+                                             llvm::maxUIntN(bitWidth));
+            })
+            .Case([&](arith::MaxSIOp) {
+              return rewriter.getIntegerAttr(constantType,
+                                             llvm::minIntN(bitWidth));
+            })
+            .Case<arith::MaxUIOp, arith::XOrIOp>(
+                [&](auto) { return rewriter.getIntegerAttr(constantType, 0); })
+            .Case([&](arith::MulFOp) {
+              return rewriter.getFloatAttr(constantType, 1.f);
+            })
+            .Case<arith::MulIOp, arith::AndIOp>(
+                [&](auto) { return rewriter.getIntegerAttr(constantType, 1); })
+            .Case([&](arith::OrIOp) {
+              return rewriter.getIntegerAttr(constantType, 0);
+            })
+            .Default([&](Operation *op) {return nullptr;});
+
+    if (!attr) {
+      auto attr = rewriter.getIntegerAttr(constantType, -1);
+      auto constOp = rewriter.create<arith::ConstantOp>(redOp->getLoc(),
+                                                        constantType, attr);
+      constOp->setAttr("invalid.constant", rewriter.getUnitAttr());
+      return constOp;
+    }
+
+    return rewriter.create<arith::ConstantOp>(redOp->getLoc(), constantType,
+                                              attr);
+  }
+
+  static bool isPlaceholder(Value v) {
+    if (auto constOp = v.getDefiningOp<arith::ConstantOp>())
+      return constOp->hasAttr("invalid.constant");
+    return false;
   }
 
   LogicalResult
@@ -1298,6 +1361,7 @@ private:
     SmallVector<Operation *> accUsers(numReductions, nullptr);
     SmallVector<bool> convertToF32(numReductions, false);
     SmallVector<Type> constantTypes(numReductions);
+    SmallVector<Value> accBaseConstOps(numReductions);
 
     for (unsigned i = 0; i < numReductions; ++i) {
       unsigned accArgIdx =
@@ -1316,6 +1380,8 @@ private:
       constantTypes[i] = convertToF32[i]
                              ? Float32Type::get(rewriter.getContext())
                              : srcElemType;
+      accBaseConstOps[i] =
+          getRedBaseConstOp(rewriter, accUser, constantTypes[i]);
     }
 
     // To be able to support any type of body in the reduce op, we
@@ -1324,67 +1390,37 @@ private:
     // the source element type, and that the reduction region body
     // is valid without any modification and no need for constants.
     SmallVector<Value> initTensors(numReductions);
-    SmallVector<Value> slicedSources(numReductions);
 
     for (unsigned i = 0; i < numReductions; ++i) {
       Value firstElem =
           getFirstElementAlongAxis(rewriter, sources[i], axis, loc);
+      Value initVal =
+          isPlaceholder(accBaseConstOps[i]) ? firstElem : accBaseConstOps[i];
       Value initTensor;
       if (isVectorReduce) {
         // First element is scalar already, so wrap in rank-0 tensor
         Value alloc = rewriter.create<bufferization::AllocTensorOp>(
-            loc, RankedTensorType::get({}, firstElem.getType()), ValueRange{});
-        initTensor = rewriter.create<tensor::InsertOp>(loc, firstElem, alloc,
+            loc, RankedTensorType::get({}, initVal.getType()), ValueRange{});
+        initTensor = rewriter.create<tensor::InsertOp>(loc, initVal, alloc,
                                                        ValueRange{});
       } else {
-        // Create output shape and fill from firstElem
+        // Create output shape and fill from initVal
         auto resRanked = cast<RankedTensorType>(op.getResult()[i].getType());
         SmallVector<int64_t> resShape(resRanked.getShape().begin(),
                                       resRanked.getShape().end());
         Value empty =
             rewriter.create<tensor::EmptyOp>(loc, resShape, constantTypes[i]);
         initTensor = rewriter
-                         .create<linalg::FillOp>(loc, ValueRange{firstElem},
+                         .create<linalg::FillOp>(loc, ValueRange{initVal},
                                                  ValueRange{empty})
                          .result();
       }
       initTensors[i] = initTensor;
-
-      //  Slice source to skip first element along `axis` this is needed for
-      //  correct accumulation as we are using the first element as the init
-      //  value of the accumulator
-      auto srcType = cast<RankedTensorType>(sources[i].getType());
-      int64_t rank = srcType.getRank();
-
-      // Offsets: all zeros except 'axis' = 1
-      SmallVector<OpFoldResult> offsets(rank, rewriter.getIndexAttr(0));
-      offsets[axis] = rewriter.getIndexAttr(1);
-
-      // Strides: all ones
-      SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
-
-      // Sizes: dim - 1 along `axis`, dim along others
-      SmallVector<OpFoldResult> sizes;
-      for (int64_t d = 0; d < rank; ++d) {
-        Value dimSize = rewriter.create<tensor::DimOp>(loc, sources[i], d);
-        if (d == axis) {
-          Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-          Value dimMinusOne = rewriter.create<arith::SubIOp>(loc, dimSize, one);
-          sizes.push_back(dimMinusOne);
-        } else {
-          sizes.push_back(dimSize);
-        }
-      }
-
-      Value sliced = rewriter.create<tensor::ExtractSliceOp>(
-          loc, sources[i], offsets, sizes, strides);
-
-      slicedSources[i] = sliced;
     }
 
     // Create the linalg.reduce op
     auto reduceOp = rewriter.create<linalg::ReduceOp>(
-        loc, slicedSources, initTensors,
+        loc, sources, initTensors,
         axis, // one axis for all reductions
         [&](OpBuilder &opBuilder, Location innerLoc, ValueRange inputs) {
           // expected inputs.size() == 2 * numReductions
