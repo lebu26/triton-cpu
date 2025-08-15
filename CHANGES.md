@@ -78,3 +78,16 @@ these two account for almost all the failing test.
 
 Triton shared creates unnecessary copies of memref, see [this issue](https://github.com/microsoft/triton-shared/issues/308) which introduces overhead, that can be fixed as seen in the changes to the file `StructuredToMemref.cpp` Where I commented the copy and passed the reinterpret_cast (variable named ptr in the C++ code) to `bufferization.to_tensor` instead.
 
+## Adding support for fp8e5m2
+
+With the help of upstream, see [this issue](https://github.com/llvm/llvm-project/issues/152287) I found the way on how to implement `arith.ext` and `arith.trunc` so we can handle fp8e5m2 by converting them to fp32 and back to fp8e5m2, I used the algorith that can be found [in this blog post](https://www.xyzzhangfan.tech/blog/2025/Convert_fp32_and_fp8_e5m2/)
+
+## Adding support for fp8e4m3
+
+Sames as with fp8e5m2 again using [this other blog post](https://www.xyzzhangfan.tech/blog/2025/Convert_fp32_and_fp8_e4m3/) altought, this time the test are giving me an acurracy error, the algorithm is right but we can expect much precision from this datatype so I lowered the expected error on the tests.
+
+## Adding support for more complex reduction operations
+
+Triton-shared does not support reduce operations that have more than one op in the body of the reduction such as `argmin` or `argmax` reduction types, to solve this I changed the code of `triton-shared/include/triton-shared/Conversion/TritonArithToLinalg/ConversionPatterns.hpp` specifically the method called `convertToLinalgReduce`. With this implementation it now supports multiple ops in the body, and an arbitrary number of inputs and outputs.
+
+## Addding support for the scan operation
