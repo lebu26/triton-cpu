@@ -2034,7 +2034,7 @@ public:
     Location loc = op.getLoc();
     Value input = op.getOperand(0);
     auto output = op.getResult();
-    auto inputType = input.getType().cast<RankedTensorType>();
+    auto inputType = input.getType().dyn_cast<RankedTensorType>();
     int64_t rank = inputType.getRank();
     int axis = op.getAxis();
     bool reverse = op.getReverse(); // You’ll need to handle this
@@ -2045,11 +2045,11 @@ public:
         input);
 
     // 2. Allocate output
-   Value outputMemref = rewriter.create<memref::AllocOp>(
+    Value outputMemref = rewriter.create<memref::AllocOp>(
         loc, MemRefType::get(inputType.getShape(), inputType.getElementType()));
 
     // 3. Build loop nest
-   SmallVector<Value> lbs, ubs, steps;
+    SmallVector<Value> lbs, ubs, steps;
     lbs.reserve(rank);
     ubs.reserve(rank);
     steps.reserve(rank);
@@ -2068,32 +2068,56 @@ public:
     auto loopNest = scf::buildLoopNest(
         rewriter, loc, lbs, ubs, steps,
         [&](OpBuilder &b, Location loc, ValueRange ivs) {
-          Value idxAxis = ivs[axis];
+          Value ivAxis = ivs[axis]; // 0..N-1
           Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
           Value one = b.create<arith::ConstantIndexOp>(loc, 1);
+          Value dimSize = ubs[axis]; // outer ubs vector
 
-          // if idxAxis == 0
+          // Compute pos = logical index along scan axis
+          Value pos;
+          if (reverse) {
+            // pos = (dimSize - 1) - ivAxis
+            Value dimMinus1 = b.create<arith::SubIOp>(loc, dimSize, one);
+            pos = b.create<arith::SubIOp>(loc, dimMinus1, ivAxis);
+          } else {
+            pos = ivAxis;
+          }
+
+          // Base case check: first iteration of the loop (ivAxis == 0)
           Value isFirst = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
-                                                  idxAxis, zero);
+                                                  ivAxis, zero);
+
+          // Build index vector that uses `pos` on the scan axis
+          SmallVector<Value> idxs(ivs.begin(), ivs.end());
+          idxs[axis] = pos;
+
           b.create<scf::IfOp>(
               loc, isFirst,
               [&](OpBuilder &b, Location loc) {
-                // First element in scan
-                Value val = b.create<memref::LoadOp>(loc, inputMemref, ivs);
-                b.create<memref::StoreOp>(loc, val, outputMemref, ivs);
+                // first element (pos is either 0 or dimSize-1 depending on
+                // reverse)
+                Value val = b.create<memref::LoadOp>(loc, inputMemref, idxs);
+                b.create<memref::StoreOp>(loc, val, outputMemref, idxs);
                 b.create<scf::YieldOp>(loc);
               },
               [&](OpBuilder &b, Location loc) {
-                // General case
-                SmallVector<Value> prevIdx(ivs.begin(), ivs.end());
-                Value prevAxis = b.create<arith::SubIOp>(loc, idxAxis, one);
-                prevIdx[axis] = prevAxis;
+                // general case: read accumulator from previous logical position
+                SmallVector<Value> prevIdx = idxs;
+                Value prevPos;
+                if (reverse) {
+                  // prev = pos + 1
+                  prevPos = b.create<arith::AddIOp>(loc, pos, one);
+                } else {
+                  // prev = pos - 1
+                  prevPos = b.create<arith::SubIOp>(loc, pos, one);
+                }
+                prevIdx[axis] = prevPos;
 
                 Value acc =
                     b.create<memref::LoadOp>(loc, outputMemref, prevIdx);
-                Value cur = b.create<memref::LoadOp>(loc, inputMemref, ivs);
+                Value cur = b.create<memref::LoadOp>(loc, inputMemref, idxs);
 
-                // Clone binary op region from tt.scan
+                // clone the reduction region, mapping its args -> (acc, cur)
                 IRMapping mapping;
                 mapping.map(op.getRegion().front().getArgument(0), acc);
                 mapping.map(op.getRegion().front().getArgument(1), cur);
@@ -2103,14 +2127,14 @@ public:
 
                 Value resultVal = mapping.lookupOrDefault(
                     op.getRegion().front().getTerminator()->getOperand(0));
-                b.create<memref::StoreOp>(loc, resultVal, outputMemref, ivs);
+                b.create<memref::StoreOp>(loc, resultVal, outputMemref, idxs);
                 b.create<scf::YieldOp>(loc);
               });
         });
 
     // 4. Convert result memref back to tensor
-    Value resultTensor =
-        rewriter.create<bufferization::ToTensorOp>(loc, outputMemref, true, true);
+    Value resultTensor = rewriter.create<bufferization::ToTensorOp>(
+        loc, outputMemref, true, true);
 
     rewriter.replaceOp(op, resultTensor);
     return success();
