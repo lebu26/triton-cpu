@@ -16,6 +16,7 @@
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/Transforms/Transforms.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -116,7 +117,7 @@ public:
         linalg::LinalgDialect, affine::AffineDialect, scf::SCFDialect,
         cf::ControlFlowDialect, tensor::TensorDialect,
         bufferization::BufferizationDialect, ttx::TritonTilingExtDialect,
-        tts::TritonStructuredDialect>();
+        tts::TritonStructuredDialect, memref::MemRefDialect>();
 
     target.addLegalOp<ModuleOp>();
 

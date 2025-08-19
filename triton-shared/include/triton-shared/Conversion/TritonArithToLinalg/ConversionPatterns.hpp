@@ -1295,7 +1295,7 @@ private:
             .Case([&](arith::OrIOp) {
               return rewriter.getIntegerAttr(constantType, 0);
             })
-            .Default([&](Operation *op) {return nullptr;});
+            .Default([&](Operation *op) { return nullptr; });
 
     if (!attr) {
       auto attr = rewriter.getIntegerAttr(constantType, -1);
@@ -2027,67 +2027,92 @@ struct DenseConstantConverter : public OpConversionPattern<arith::ConstantOp> {
 class CumSumConverter : public OpConversionPattern<triton::ScanOp> {
   using OpConversionPattern<triton::ScanOp>::OpConversionPattern;
 
-  // CumSum is a specific instance of Scan that looks like the following:
-  //       %1 = "tt.scan"(%0) <{axis = 1 : i32}> ({
-  //       ^bb0(%arg0: f32, %arg1: f32):
-  //         %2 = arith.addf %arg0, %arg1 : f32
-  //         tt.scan.return %2 : f32
-  //       }) : (tensor<4x4xf32>) -> tensor<4x4xf32>
-  bool isCumSum(triton::ScanOp op) const {
-    auto scanBlock = op.getBody();
-    auto ops = llvm::map_to_vector(scanBlock->without_terminator(),
-                                   [](Operation &op) { return &op; });
-
-    if (ops.size() != 1) {
-      return false;
-    }
-
-    auto addOp = ops.front();
-    if (isa<arith::AddFOp, arith::AddIOp>(addOp)) {
-      if (addOp->getResult(0) != scanBlock->getTerminator()->getOperand(0)) {
-        return false;
-      }
-
-      auto blockArgs =
-          llvm::map_range(scanBlock->getArguments(), [](BlockArgument arg) {
-            return dyn_cast<Value>(arg);
-          });
-
-      auto addArgs = addOp->getOperands();
-
-      return DenseSet<Value>(blockArgs.begin(), blockArgs.end()) ==
-             DenseSet<Value>(addArgs.begin(), addArgs.end());
-    }
-
-    return false;
-  }
-
 public:
   LogicalResult
   matchAndRewrite(triton::ScanOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (!isCumSum(op)) {
-      return rewriter.notifyMatchFailure(
-          op, "Only support cumsum variant of scan op");
+    Location loc = op.getLoc();
+    Value input = op.getOperand(0);
+    auto output = op.getResult();
+    auto inputType = input.getType().cast<RankedTensorType>();
+    int64_t rank = inputType.getRank();
+    int axis = op.getAxis();
+    bool reverse = op.getReverse(); // You’ll need to handle this
+
+    // 1. Bufferize input (or assume already memref)
+    Value inputMemref = rewriter.create<bufferization::ToMemrefOp>(
+        loc, MemRefType::get(inputType.getShape(), inputType.getElementType()),
+        input);
+
+    // 2. Allocate output
+   Value outputMemref = rewriter.create<memref::AllocOp>(
+        loc, MemRefType::get(inputType.getShape(), inputType.getElementType()));
+
+    // 3. Build loop nest
+   SmallVector<Value> lbs, ubs, steps;
+    lbs.reserve(rank);
+    ubs.reserve(rank);
+    steps.reserve(rank);
+
+    for (int64_t i = 0; i < rank; ++i) {
+      Value lb = rewriter.create<arith::ConstantIndexOp>(loc, 0).getResult();
+      lbs.push_back(lb);
+      int64_t dimSize = inputType.getDimSize(i);
+      Value ub =
+          rewriter.create<arith::ConstantIndexOp>(loc, dimSize).getResult();
+      ubs.push_back(ub);
+      Value step = rewriter.create<arith::ConstantIndexOp>(loc, 1).getResult();
+      steps.push_back(step);
     }
 
-    auto input = op.getOperand(0);
-    auto axis = op.getAxis();
-    auto type = dyn_cast<RankedTensorType>(input.getType());
+    auto loopNest = scf::buildLoopNest(
+        rewriter, loc, lbs, ubs, steps,
+        [&](OpBuilder &b, Location loc, ValueRange ivs) {
+          Value idxAxis = ivs[axis];
+          Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
+          Value one = b.create<arith::ConstantIndexOp>(loc, 1);
 
-    if (type.getRank() != 1 && type.getRank() != 2 &&
-        axis != type.getRank() - 1) {
-      return rewriter.notifyMatchFailure(
-          op, "Only support lowering scan op to cumsum with rank "
-              "= {1, 2} and axis = rank - 1");
-    }
+          // if idxAxis == 0
+          Value isFirst = b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                                  idxAxis, zero);
+          b.create<scf::IfOp>(
+              loc, isFirst,
+              [&](OpBuilder &b, Location loc) {
+                // First element in scan
+                Value val = b.create<memref::LoadOp>(loc, inputMemref, ivs);
+                b.create<memref::StoreOp>(loc, val, outputMemref, ivs);
+                b.create<scf::YieldOp>(loc);
+              },
+              [&](OpBuilder &b, Location loc) {
+                // General case
+                SmallVector<Value> prevIdx(ivs.begin(), ivs.end());
+                Value prevAxis = b.create<arith::SubIOp>(loc, idxAxis, one);
+                prevIdx[axis] = prevAxis;
 
-    Value init = rewriter.create<tensor::EmptyOp>(op.getLoc(), type.getShape(),
-                                                  type.getElementType());
+                Value acc =
+                    b.create<memref::LoadOp>(loc, outputMemref, prevIdx);
+                Value cur = b.create<memref::LoadOp>(loc, inputMemref, ivs);
 
-    rewriter.replaceOpWithNewOp<ttx::CumSumOp>(
-        op, input, rewriter.getUI32IntegerAttr(axis), init);
+                // Clone binary op region from tt.scan
+                IRMapping mapping;
+                mapping.map(op.getRegion().front().getArgument(0), acc);
+                mapping.map(op.getRegion().front().getArgument(1), cur);
+                for (Operation &innerOp :
+                     op.getRegion().front().without_terminator())
+                  b.clone(innerOp, mapping);
 
+                Value resultVal = mapping.lookupOrDefault(
+                    op.getRegion().front().getTerminator()->getOperand(0));
+                b.create<memref::StoreOp>(loc, resultVal, outputMemref, ivs);
+                b.create<scf::YieldOp>(loc);
+              });
+        });
+
+    // 4. Convert result memref back to tensor
+    Value resultTensor =
+        rewriter.create<bufferization::ToTensorOp>(loc, outputMemref, true, true);
+
+    rewriter.replaceOp(op, resultTensor);
     return success();
   }
 };
