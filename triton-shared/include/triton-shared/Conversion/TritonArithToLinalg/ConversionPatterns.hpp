@@ -2032,21 +2032,40 @@ public:
   matchAndRewrite(triton::ScanOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    Value input = op.getOperand(0);
-    auto output = op.getResult();
-    auto inputType = input.getType().dyn_cast<RankedTensorType>();
-    int64_t rank = inputType.getRank();
+    SmallVector<Value> sources(adaptor.getOperands().begin(),
+                               adaptor.getOperands().end());
+    unsigned numReductions = sources.size();
+
+    if (numReductions == 0) {
+      return rewriter.notifyMatchFailure(
+          op, "Expected at least one source operand for scan");
+    }
+
+    SmallVector<RankedTensorType> inputTypes;
+    inputTypes.reserve(numReductions);
+    for (Value source : sources) {
+      auto rankedType = dyn_cast<RankedTensorType>(source.getType());
+      if (!rankedType || !rankedType.hasRank()) {
+        return rewriter.notifyMatchFailure(
+            op, "Expected all source operands to be ranked tensors");
+      }
+      inputTypes.push_back(rankedType);
+    }
+
+    // All sources must have the same rank (ScanOp requires that).
+    int64_t rank = inputTypes[0].getRank();
+
     int axis = op.getAxis();
-    bool reverse = op.getReverse(); // You’ll need to handle this
+    bool reverse = op.getReverse();
 
-    // 1. Bufferize input (or assume already memref)
-    Value inputMemref = rewriter.create<bufferization::ToMemrefOp>(
-        loc, MemRefType::get(inputType.getShape(), inputType.getElementType()),
-        input);
-
-    // 2. Allocate output
-    Value outputMemref = rewriter.create<memref::AllocOp>(
-        loc, MemRefType::get(inputType.getShape(), inputType.getElementType()));
+    // 2. Allocate output memrefs
+    SmallVector<Value> outputMemrefs;
+    outputMemrefs.reserve(numReductions);
+    for (unsigned i = 0; i < numReductions; ++i) {
+      outputMemrefs.push_back(rewriter.create<memref::AllocOp>(
+          loc, MemRefType::get(inputTypes[i].getShape(),
+                               inputTypes[i].getElementType())));
+    }
 
     // 3. Build loop nest
     SmallVector<Value> lbs, ubs, steps;
@@ -2057,7 +2076,7 @@ public:
     for (int64_t i = 0; i < rank; ++i) {
       Value lb = rewriter.create<arith::ConstantIndexOp>(loc, 0).getResult();
       lbs.push_back(lb);
-      int64_t dimSize = inputType.getDimSize(i);
+      int64_t dimSize = inputTypes[0].getDimSize(i);
       Value ub =
           rewriter.create<arith::ConstantIndexOp>(loc, dimSize).getResult();
       ubs.push_back(ub);
@@ -2065,6 +2084,7 @@ public:
       steps.push_back(step);
     }
 
+    // capture ubs, axis, reverse from outer scope
     auto loopNest = scf::buildLoopNest(
         rewriter, loc, lbs, ubs, steps,
         [&](OpBuilder &b, Location loc, ValueRange ivs) {
@@ -2096,12 +2116,16 @@ public:
               [&](OpBuilder &b, Location loc) {
                 // first element (pos is either 0 or dimSize-1 depending on
                 // reverse)
-                Value val = b.create<memref::LoadOp>(loc, inputMemref, idxs);
-                b.create<memref::StoreOp>(loc, val, outputMemref, idxs);
+                for (unsigned i = 0; i < numReductions; ++i) {
+                  Value v =
+                      b.create<tensor::ExtractOp>(loc, sources[i], idxs);
+                  b.create<memref::StoreOp>(loc, v, outputMemrefs[i], idxs);
+                }
                 b.create<scf::YieldOp>(loc);
               },
               [&](OpBuilder &b, Location loc) {
-                // general case: read accumulator from previous logical position
+                // general case: read accumulator from previous logical
+                // position
                 SmallVector<Value> prevIdx = idxs;
                 Value prevPos;
                 if (reverse) {
@@ -2113,30 +2137,54 @@ public:
                 }
                 prevIdx[axis] = prevPos;
 
-                Value acc =
-                    b.create<memref::LoadOp>(loc, outputMemref, prevIdx);
-                Value cur = b.create<memref::LoadOp>(loc, inputMemref, idxs);
+                SmallVector<Value> accs(numReductions), curs(numReductions);
+                for (unsigned i = 0; i < numReductions; ++i) {
+                  // read the previous value from the output memref
+                  accs[i] =
+                      b.create<memref::LoadOp>(loc, outputMemrefs[i], prevIdx);
+                  // read the current value from the input memref
+                  curs[i] =
+                      b.create<tensor::ExtractOp>(loc, sources[i], idxs);
+                }
 
-                // clone the reduction region, mapping its args -> (acc, cur)
+                // Map ALL 2*N args: [outputs..., inputs...]
                 IRMapping mapping;
-                mapping.map(op.getRegion().front().getArgument(0), acc);
-                mapping.map(op.getRegion().front().getArgument(1), cur);
+                Block &reg = op.getRegion().front();
+                // NOTE: accs come before the inputs which is counterintutive
+                // Map input args (regionArg[0..N-1]) -> accs
+                for (unsigned i = 0; i < numReductions; ++i)
+                  mapping.map(reg.getArgument(i), accs[i]);
+                // Map accumulator args (regionArg[N..2N-1]) -> curs
+                for (unsigned i = 0; i < numReductions; ++i)
+                  mapping.map(reg.getArgument(numReductions + i), curs[i]);
+
                 for (Operation &innerOp :
                      op.getRegion().front().without_terminator())
                   b.clone(innerOp, mapping);
 
-                Value resultVal = mapping.lookupOrDefault(
-                    op.getRegion().front().getTerminator()->getOperand(0));
-                b.create<memref::StoreOp>(loc, resultVal, outputMemref, idxs);
+                Operation *term = reg.getTerminator();
+                SmallVector<Value> results(numReductions);
+                for (unsigned i = 0; i < numReductions; ++i) {
+                  results[i] = mapping.lookupOrDefault(term->getOperand(i));
+                }
+
+                // Store each result
+                for (unsigned i = 0; i < numReductions; ++i)
+                  b.create<memref::StoreOp>(loc, results[i], outputMemrefs[i],
+                                            idxs);
+
                 b.create<scf::YieldOp>(loc);
               });
         });
 
-    // 4. Convert result memref back to tensor
-    Value resultTensor = rewriter.create<bufferization::ToTensorOp>(
-        loc, outputMemref, true, true);
+    SmallVector<Value> resultTensors;
+    resultTensors.reserve(numReductions);
+    for (unsigned i = 0; i < numReductions; ++i) {
+      resultTensors.push_back(rewriter.create<bufferization::ToTensorOp>(
+          loc, outputMemrefs[i], true, true));
+    }
 
-    rewriter.replaceOp(op, resultTensor);
+    rewriter.replaceOp(op, ValueRange{resultTensors});
     return success();
   }
 };

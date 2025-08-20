@@ -91,3 +91,13 @@ Sames as with fp8e5m2 again using [this other blog post](https://www.xyzzhangfan
 Triton-shared does not support reduce operations that have more than one op in the body of the reduction such as `argmin` or `argmax` reduction types, to solve this I changed the code of `triton-shared/include/triton-shared/Conversion/TritonArithToLinalg/ConversionPatterns.hpp` specifically the method called `convertToLinalgReduce`. With this implementation it now supports multiple ops in the body, and an arbitrary number of inputs and outputs.
 
 ## Addding support for the scan operation
+
+The scan operation performs a cumulative reduction, simply that means a reduction but storing all of the intermiediate results, for instance a scan operation with just and add operation in it's body is just a [cumsum](https://numpy.org/devdocs/reference/generated/numpy.cumsum.html). 
+
+As there is no such operation in standard MLIR (though there is in other projects like IREE) it's not possible to just translate it to a high level equivalent operation. Because of that, the best solution I found was just to lower it to loops directly.
+
+At a conceptual level, this implementation works as follows:
+
+* We iterate over all elements of the input tensor(s), treating the scan axis specially.
+* For the first element along the scan axis, the output is initialized directly from the input.
+* For the remaining elements, we load the previous accumulator value, apply the scan operation (which gets clone from the original `tt.scan`), and store the updated result.
