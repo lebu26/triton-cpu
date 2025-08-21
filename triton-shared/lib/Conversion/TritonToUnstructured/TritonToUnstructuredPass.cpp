@@ -293,6 +293,9 @@ public:
         auto res =
             llvm::TypeSwitch<Operation *, LogicalResult>(user)
                 .Case<triton::PtrToIntOp>([&](triton::PtrToIntOp op) {
+		  if (isa<RankedTensorType>(op.getType())) {
+		    return failure();
+		  }
                   auto offsetInfo = offsetMap.at(op.getSrc());
                   OpBuilder b{op};
                   // We are converting a pointer to an integer here,
