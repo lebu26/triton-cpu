@@ -32,6 +32,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/ErrorHandling.h"
 
 #include <algorithm>
 #include <cassert>
@@ -279,16 +280,14 @@ private:
         /* staticStrides */
         SmallVector<int64_t>(resultShape.size(), ShapedType::kDynamic),
         /* result shape */
-        SmallVector<int64_t>{
-            // Row is dynamic, in most cases, this should
-            // be the same as the original row. The last
-            // chunk may be smaller due to wrapping
-            // around.
-            ShapedType::kDynamic,
+        SmallVector<int64_t>{// Row is dynamic, in most cases, this should
+                             // be the same as the original row. The last
+                             // chunk may be smaller due to wrapping
+                             // around.
+                             ShapedType::kDynamic,
 
-            // Col stays the same.
-            ShapedType::kDynamic
-        });
+                             // Col stays the same.
+                             ShapedType::kDynamic});
 
     Value rowSize = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getIndexAttr(op.getSizes()[0]));
@@ -298,7 +297,7 @@ private:
     Value strideRow = ofrToIndexValue(op.getMixedStrides()[0], loc, rewriter);
     Value strideCol = ofrToIndexValue(op.getMixedStrides()[1], loc, rewriter);
 
-    Value modRow = op.getShape()[0];
+    Value modRow = ofrToIndexValue(op.getMixedShape()[0], loc, rewriter);
 
     // First chunk
     Value wrappedAroundOff =
@@ -330,20 +329,30 @@ private:
 
     auto parentShape = op.getStaticShape();
 
+    assert(parentShape.size() == 2 &&
+           "Only support split pointer for 2D tensors only");
+
     SmallVector<Value> casts;
     StringRef wrapType;
 
-    if (parentShape[0] == ShapedType::kDynamic) {
+    // For split pointers, a split dimension is either a dynamic or a non-zero
+    // value. The other dimension must be zero.
+    auto isSplitDimension = [](int64_t dim) {
+      return dim == ShapedType::kDynamic || dim != 0;
+    };
+    if (isSplitDimension(parentShape[0])) {
       // Stacked case
       assert(parentShape[1] == 0);
       auto [cast1, cast2] = createStackedCastOps(op, adaptor, rewriter);
       casts = {cast1.getResult(), cast2.getResult()};
       wrapType = WRAP_STACKED;
-    } else {
+    } else if (isSplitDimension(parentShape[1])) {
       assert(parentShape[0] == 0);
       auto [cast1, cast2] = createSideBySideCastOps(op, adaptor, rewriter);
       casts = {cast1.getResult(), cast2.getResult()};
       wrapType = WRAP_SIDE_BY_SIDE;
+    } else {
+      llvm_unreachable("Unexpected split pointer shape");
     }
 
     auto combinedCast = rewriter.create<UnrealizedConversionCastOp>(
@@ -466,7 +475,7 @@ private:
                                            /* strides */
                                            ValueRange{one, one});
 
-    //raise(SIGTRAP);
+    // raise(SIGTRAP);
     rewriter.create<memref::CopyOp>(loc, block1, block1Dst);
     rewriter.create<memref::CopyOp>(loc, block2, block2Dst);
   }
@@ -502,7 +511,7 @@ private:
                                            /* strides */
                                            ValueRange{one, one});
 
-    //raise(SIGTRAP);
+    // raise(SIGTRAP);
     rewriter.create<memref::CopyOp>(loc, block1, block1Dst);
     rewriter.create<memref::CopyOp>(loc, block2, block2Dst);
   }
@@ -597,7 +606,7 @@ private:
         llvm_unreachable("unexpected wraparound type");
       }
     } else {
-      //rewriter.create<memref::CopyOp>(loc, ptr, alloc);
+      // rewriter.create<memref::CopyOp>(loc, ptr, alloc);
     }
 
     Value tensor = rewriter.create<bufferization::ToTensorOp>(
@@ -684,7 +693,7 @@ private:
           getSubview(tensorType.getRank(), mixedDims, ptr, loc, rewriter);
       memref::SubViewOp dstSubview =
           getSubview(tensorType.getRank(), mixedDims, alloc, loc, rewriter);
-      //raise(SIGTRAP);
+      // raise(SIGTRAP);
       rewriter.create<memref::CopyOp>(loc, srcSubview, dstSubview);
     }
 
