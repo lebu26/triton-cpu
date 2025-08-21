@@ -15,21 +15,23 @@
 //===----------------------------------------------------------------------===//
 
 #include "triton-shared/Conversion/TritonToLinalgExperimental/ReconcilePtrCasts.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
 #include "mlir/Dialect/Ptr/IR/PtrTypes.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+
+#include "triton/Dialect/Triton/IR/Types.h"
+#include "triton-shared/Conversion/TritonToLinalgExperimental/ReconcilePtrCasts.h"
 #include "triton-shared/Dialect/TPtr/IR/TPtrDialect.h"
 
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
 
-#include "mlir/Pass/PassManager.h"
-#include "triton/Dialect/Triton/IR/Types.h"
 
 using namespace mlir;
 using namespace triton;
@@ -91,7 +93,7 @@ struct FromMemrefConverter
       // from_memref only takes ranked memref, cast the unranked memref to
       // ranked memref first.
       auto rankedMemref = rewriter.create<memref::CastOp>(
-          op.getLoc(), MemRefType::get({}, unrankedInput.getElementType()),
+          op.getLoc(), MemRefType::get({1}, unrankedInput.getElementType()),
           input);
       auto memrefToPtr = rewriter.create<tptr::FromMemrefOp>(
           op->getLoc(), ptr::PtrType::get(rewriter.getContext()), rankedMemref);
