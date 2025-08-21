@@ -269,6 +269,18 @@ public:
       }
     });
 
+    getOperation().walk([&](triton::IntToPtrOp op) {
+      auto res = op.getResult();
+      OpBuilder b(op);
+      Value zero = b.create<arith::ConstantOp>(
+          op.getLoc(),
+          b.getIntegerAttr(IntegerType::get(&getContext(), defaultBitWidth),
+                           0));
+
+      offsetMap.insert({res, {res, res.getType(), defaultBitWidth, zero}});
+      workList.push(res);
+    });
+
     llvm::SmallVector<Operation *> toDelete;
     llvm::SmallVector<Operation *> ptrUsers;
 
@@ -395,7 +407,6 @@ public:
                   // process uses of the iter-arg.
                   PtrOffset iterArgOffset{offsetInfo.ptr, offsetInfo.ptrType,
                                           offsetInfo.bitWidth, iterArg};
-                  // offsetInfo.offset = iterArg;
                   offsetMap.insert({
                       iterArg,
                       iterArgOffset,
@@ -457,10 +468,8 @@ public:
               })
               .Case<triton::StoreOp>([&](triton::StoreOp store) {
                 auto offsetInfo = offsetMap.at(store.getPtr());
-                auto scatter = b.create<tts::ScatterOp>(
-                    loc, offsetInfo.ptr, offsetInfo.offset, store.getValue(),
-                    store.getMask());
-
+                b.create<tts::ScatterOp>(loc, offsetInfo.ptr, offsetInfo.offset,
+                                         store.getValue(), store.getMask());
                 store->erase();
                 return success();
               })
@@ -531,7 +540,8 @@ public:
 
   void runOnOperation() override {
     if (failed(processUnstructuredPtrs(offsetBitWidth))) {
-      signalPassFailure();
+      getOperation()->emitWarning(
+          "Cannot canonicalize tensor of pointers into a single base pointer");
       return;
     }
 
