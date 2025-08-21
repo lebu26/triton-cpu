@@ -711,10 +711,13 @@ LogicalResult PtrAnalysis::visitOperand(Value operand, PtrState &state,
       } else if (auto intToPtrOp = dyn_cast<triton::IntToPtrOp>(op)) {
         return visitOperandIntToPtr(intToPtrOp, state, loc, builder);
       } else if (auto makeTensorOp = dyn_cast<triton::MakeTensorPtrOp>(op)) {
-        op->emitRemark("Unexpected defining op for triton pointer operand");
-	return failure();
+	llvm_unreachable("Unexpected operand defining operation tts.make_tptr");
+      } else if (auto ifOp = dyn_cast<scf::IfOp>(op)){
+        state.source = operand;
+	return success();
       } else {
-        llvm_unreachable("Unexpected operand defining operation");
+        op->emitRemark("Unexpected operand defining operation");
+	return failure();
       }
     } else {
       state.source = operand;
