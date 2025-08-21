@@ -15,8 +15,8 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/Transforms/Transforms.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -122,6 +122,10 @@ public:
     target.addLegalOp<ModuleOp>();
 
     target.addLegalOp<triton::FuncOp, triton::ReturnOp>();
+
+    target.addDynamicallyLegalOp<triton::BitcastOp>([](triton::BitcastOp op) {
+      return isa<triton::PointerType>(op.getSrc().getType());
+    });
 
     target.addDynamicallyLegalDialect<arith::ArithDialect, math::MathDialect>(
         [](Operation *op) {

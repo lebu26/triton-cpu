@@ -853,6 +853,12 @@ struct BitcastConverter : public OpConversionPattern<triton::BitcastOp> {
   LogicalResult
   matchAndRewrite(triton::BitcastOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+
+    // arith::bitcast does not support casting pointers
+    if (isa<triton::PointerType>(op.getSrc().getType())) {
+      return failure();
+    }
+
     auto arithBitcast = rewriter.create<arith::BitcastOp>(
         op.getLoc(), op.getType(), op.getOperand());
 
@@ -2117,8 +2123,7 @@ public:
                 // first element (pos is either 0 or dimSize-1 depending on
                 // reverse)
                 for (unsigned i = 0; i < numReductions; ++i) {
-                  Value v =
-                      b.create<tensor::ExtractOp>(loc, sources[i], idxs);
+                  Value v = b.create<tensor::ExtractOp>(loc, sources[i], idxs);
                   b.create<memref::StoreOp>(loc, v, outputMemrefs[i], idxs);
                 }
                 b.create<scf::YieldOp>(loc);
@@ -2143,8 +2148,7 @@ public:
                   accs[i] =
                       b.create<memref::LoadOp>(loc, outputMemrefs[i], prevIdx);
                   // read the current value from the input memref
-                  curs[i] =
-                      b.create<tensor::ExtractOp>(loc, sources[i], idxs);
+                  curs[i] = b.create<tensor::ExtractOp>(loc, sources[i], idxs);
                 }
 
                 // Map ALL 2*N args: [outputs..., inputs...]

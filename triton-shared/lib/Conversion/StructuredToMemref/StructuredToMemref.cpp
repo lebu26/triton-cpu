@@ -178,7 +178,7 @@ private:
         SmallVector<int64_t>{
 
             // Row stays the same
-            resultShape[0],
+            ShapedType::kDynamic,
 
             // Column is dynamic, in most cases, this
             // should be the same as the original column.
@@ -287,7 +287,7 @@ private:
             ShapedType::kDynamic,
 
             // Col stays the same.
-            resultShape[1],
+            ShapedType::kDynamic
         });
 
     Value rowSize = rewriter.create<arith::ConstantOp>(
