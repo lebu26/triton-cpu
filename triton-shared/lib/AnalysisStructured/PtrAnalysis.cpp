@@ -398,8 +398,10 @@ LogicalResult PtrState::mulState(const PtrState &lhsState,
       OpFoldResult newOffset =
           mulOFRs(lhs->offsets[i], rhsStride, loc, builder);
       offsets.push_back(newOffset);
-      // Set stride to 1 when not continuous.
-      strides.push_back(builder.getIndexAttr(1));
+      // Mul the scalar to stride.
+      OpFoldResult newStride =
+          mulOFRs(lhs->strides[i], rhs->scalar, loc, builder);
+      strides.push_back(newStride);
     }
     OpFoldResult newShape = mulOFRs(lhs->shape[i], rhs->scalar, loc, builder);
     shape.push_back(newShape);
@@ -1201,6 +1203,11 @@ FailureOr<PtrState> PtrAnalysis::getLoopIterArgPtrState(scf::ForOp forOp,
     return failure();
   }
 
+  if (!state->isStructured()) {
+    // Skip if the loop init arg is not structured.
+    return failure();
+  }
+
   return reconcileLoopPtrState(
       forOp, index, state.value(),
       [](scf::ForOp op, size_t index) { return op.getRegionIterArg(index); });
@@ -1210,6 +1217,11 @@ FailureOr<PtrState> PtrAnalysis::getLoopResultPtrState(scf::ForOp forOp,
                                                        size_t index) {
   auto state = getLoopInitArgPtrState(forOp, index);
   if (failed(state)) {
+    return failure();
+  }
+
+  if (!state->isStructured()) {
+    // Skip if the loop init arg is not structured.
     return failure();
   }
 
@@ -1304,6 +1316,7 @@ PtrAnalysis::rewriteGetStructuredStateOp(tts::GetStructuredStateOp op) {
   if (!state.isStructured()) {
     op.emitRemark(
         "Rewrite GetStructuredStateOp failed. PtrState is not structured.");
+    op.getResult(0).replaceAllUsesWith(tritonValue);
     return failure();
   }
   Value remappedValue =

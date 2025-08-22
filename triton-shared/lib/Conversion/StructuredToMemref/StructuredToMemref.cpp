@@ -844,7 +844,7 @@ private:
 
     llvm::SmallVector<OpFoldResult> allocStrides;
     allocStrides.reserve(allocStridesInt.size());
-    for(int64_t stride : allocStridesInt) {
+    for (int64_t stride : allocStridesInt) {
       allocStrides.push_back(rewriter.getIndexAttr(stride));
     }
 
@@ -878,6 +878,8 @@ private:
                                                   gatherOffsetElt.getResult(),
                                                   gatherDim, rewriter);
     unsigned rank = ptr.getSizes().size();
+    // The subview should not apply an additional stride to the source.
+    SmallVector<OpFoldResult> oneStrides(rank, OpFoldResult(step));
     // subview from srcPtr for mask.
     // With offsets[gatherDim] set to 0 since the offset already in
     // reinterpret_cast. With sizes[gatherDim] set to 1 since we are load one
@@ -888,14 +890,14 @@ private:
       sizes = mixedDims;
       // maskOffsets should be all zero, since srcPtr already has the offsets.
       SmallVector<OpFoldResult> maskOffsets(rank, OpFoldResult(lowerBound));
-      // Use allocStrides for subview.
+      // Use oneStrides for subview.
       auto dstSubViewType = memref::SubViewOp::inferResultType(
-          cast<MemRefType>(srcPtr.getType()), maskOffsets, sizes, allocStrides);
-      srcPtr = rewriter
-                   .create<memref::SubViewOp>(
-                       loc, cast<MemRefType>(dstSubViewType), srcPtr,
-                       maskOffsets, sizes, allocStrides)
-                   .getResult();
+          cast<MemRefType>(srcPtr.getType()), maskOffsets, sizes, oneStrides);
+      srcPtr =
+          rewriter
+              .create<memref::SubViewOp>(loc, cast<MemRefType>(dstSubViewType),
+                                         srcPtr, maskOffsets, sizes, oneStrides)
+              .getResult();
     }
 
     // alloc[inductionVar]
@@ -1002,8 +1004,9 @@ private:
       mixedDims[gatherDim] = sizes[gatherDim];
       sizes = mixedDims;
     }
+    SmallVector<OpFoldResult> oneStrides(rank, OpFoldResult(step));
     auto slice = rewriter.create<tensor::ExtractSliceOp>(
-        loc, stVal, stValOffsets, sizes, strides);
+        loc, stVal, stValOffsets, sizes, oneStrides);
 
     // reinterpret_cast to current row as memRefPtr[gatherOffsetElt].
     Value dstPtr = rewriteGatherScatterPtrElement(staticSizes, ptr, memRefPtr,
@@ -1015,15 +1018,14 @@ private:
       // maskOffsets should be all zero, since srcPtr already has the offsets.
       SmallVector<OpFoldResult> maskOffsets(rank, OpFoldResult(lowerBound));
       auto dstType = memref::SubViewOp::inferResultType(
-          cast<MemRefType>(dstPtr.getType()), maskOffsets, sizes, strides);
+          cast<MemRefType>(dstPtr.getType()), maskOffsets, sizes, oneStrides);
 
       dstPtr =
           rewriter
               .create<memref::SubViewOp>(loc, cast<MemRefType>(dstType), dstPtr,
-                                         maskOffsets, sizes, strides)
+                                         maskOffsets, sizes, oneStrides)
               .getResult();
     }
-
     // store slice to dstPtr.
     auto storeOp = rewriter.create<bufferization::MaterializeInDestinationOp>(
         loc, slice, dstPtr);
