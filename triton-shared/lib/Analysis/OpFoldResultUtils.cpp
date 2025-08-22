@@ -14,6 +14,9 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
+#include "llvm/Support/Debug.h"
+#define DEBUG_TYPE "triton-ptr-analysis"
+
 namespace mlir {
 
 std::optional<int64_t> getIntAttr(const OpFoldResult ofr) {
@@ -101,7 +104,8 @@ OpFoldResult expandOFRIndex(OpFoldResult ofr, OpFoldResult targetForTy,
 
   Value v = dyn_cast<Value>(ofr);
   if (!v)
-    v = b.create<arith::ConstantOp>(loc, cast<IntegerAttr>(cast<Attribute>(ofr)));
+    v = b.create<arith::ConstantOp>(loc,
+                                    cast<IntegerAttr>(cast<Attribute>(ofr)));
 
   Type ty = v.getType();
   if (targetTy == ty)
@@ -115,11 +119,34 @@ OpFoldResult expandOFRIndex(OpFoldResult ofr, OpFoldResult targetForTy,
       v = indexTypeCast(v, targetEltTy, loc, b);
     return b.create<triton::SplatOp>(loc, targetTy, v).getResult();
   } else if (targetShapedTy && shapedTy) {
-    // TODO: support ShapedType to ShapedType.
     Type targetEltTy = targetShapedTy.getElementType();
     Type eltTy = shapedTy.getElementType();
-    if (targetShapedTy.getShape() != shapedTy.getShape())
-      llvm_unreachable("ShapedType to ShapedType must have same shape");
+    if (targetShapedTy.getShape() != shapedTy.getShape()) {
+      assert(targetEltTy == eltTy &&
+             "Only cast between same element type shaped types");
+      // This path is for case like:
+      // input_ptr + (row_indices[:, None] + row_offsets[:,None] % mod_offset) *
+      //   stride_m + col_offsets[None, :] * stride_n
+      // The modulo will be in shape of [ROW_SIZE, 1] while row_indices is in
+      // shape of [ROW_SIZE,].
+      LLVM_DEBUG({
+        llvm::dbgs() << "Reshaping ";
+        shapedTy.dump();
+        llvm::dbgs() << " to ";
+        targetShapedTy.dump();
+      });
+      SmallVector<Value> shapeValues;
+      for (auto dim : targetShapedTy.getShape()) {
+        shapeValues.push_back(
+            b.create<arith::ConstantOp>(loc, b.getIndexAttr(dim)));
+      }
+      RankedTensorType targetShapeTensorTy = RankedTensorType::get(
+          targetShapedTy.getShape().size(), b.getIndexType());
+      auto shapeTensor = b.create<tensor::FromElementsOp>(
+          loc, targetShapeTensorTy, shapeValues);
+      return b.create<triton::ReshapeOp>(loc, targetTy, v, shapeTensor)
+          .getResult();
+    }
     if (isa<IndexType>(targetEltTy) || isa<IndexType>(eltTy)) {
       assert((isa<IntegerType>(targetEltTy) || isa<IntegerType>(eltTy)) &&
              "Only cast between index type and integer type");
@@ -204,7 +231,7 @@ OpFoldResult subOFRs(const OpFoldResult lhs, const OpFoldResult rhs,
 }
 
 OpFoldResult mulOFRs(const OpFoldResult lhs, const OpFoldResult rhs,
-                         const Location loc, OpBuilder &b) {
+                     const Location loc, OpBuilder &b) {
   auto lhsIntAttr = getIntAttr(lhs);
   auto rhsIntAttr = getIntAttr(rhs);
 
@@ -313,32 +340,34 @@ OpFoldResult maxOFRs(const OpFoldResult lhs, const OpFoldResult rhs,
 }
 
 OpFoldResult compareOFRs(const OpFoldResult lhs, const OpFoldResult rhs,
-                    const arith::CmpIPredicate pred, const OpFoldResult trueOFR,
-                    const OpFoldResult falseOFR, const Location loc, OpBuilder &b) {
+                         const arith::CmpIPredicate pred,
+                         const OpFoldResult trueOFR,
+                         const OpFoldResult falseOFR, const Location loc,
+                         OpBuilder &b) {
   auto lhsIntAttr = getIntAttr(lhs);
   auto rhsIntAttr = getIntAttr(rhs);
 
   // both lhs and rhs are constants, return the result directly
   if (lhsIntAttr && rhsIntAttr) {
     switch (pred) {
-      case arith::CmpIPredicate::eq:
-        return *lhsIntAttr == *rhsIntAttr ? trueOFR : falseOFR;
-      case arith::CmpIPredicate::ne:
-        return *lhsIntAttr != *rhsIntAttr ? trueOFR : falseOFR;
-      case arith::CmpIPredicate::slt:
-      case arith::CmpIPredicate::ult:
-        return *lhsIntAttr < *rhsIntAttr ? trueOFR : falseOFR;
-      case arith::CmpIPredicate::sle:
-      case arith::CmpIPredicate::ule:
-        return *lhsIntAttr <= *rhsIntAttr ? trueOFR : falseOFR;
-      case arith::CmpIPredicate::sgt:
-      case arith::CmpIPredicate::ugt:
-        return *lhsIntAttr > *rhsIntAttr ? trueOFR : falseOFR;
-      case arith::CmpIPredicate::sge:
-      case arith::CmpIPredicate::uge:
-        return *lhsIntAttr >= *rhsIntAttr ? trueOFR : falseOFR;
-      default:
-        llvm_unreachable("Unsupported predicate");
+    case arith::CmpIPredicate::eq:
+      return *lhsIntAttr == *rhsIntAttr ? trueOFR : falseOFR;
+    case arith::CmpIPredicate::ne:
+      return *lhsIntAttr != *rhsIntAttr ? trueOFR : falseOFR;
+    case arith::CmpIPredicate::slt:
+    case arith::CmpIPredicate::ult:
+      return *lhsIntAttr < *rhsIntAttr ? trueOFR : falseOFR;
+    case arith::CmpIPredicate::sle:
+    case arith::CmpIPredicate::ule:
+      return *lhsIntAttr <= *rhsIntAttr ? trueOFR : falseOFR;
+    case arith::CmpIPredicate::sgt:
+    case arith::CmpIPredicate::ugt:
+      return *lhsIntAttr > *rhsIntAttr ? trueOFR : falseOFR;
+    case arith::CmpIPredicate::sge:
+    case arith::CmpIPredicate::uge:
+      return *lhsIntAttr >= *rhsIntAttr ? trueOFR : falseOFR;
+    default:
+      llvm_unreachable("Unsupported predicate");
     }
   }
 
