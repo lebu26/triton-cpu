@@ -225,15 +225,15 @@ LogicalResult PtrState::addState(const PtrState &lhsState,
       // New offset is offset * stride.
       auto newLhsOffset = lhsState.offsets[i];
       if (!hasConstZero(lhsState.strides[i])) {
-        auto stride = expandOFRIndex(lhsState.strides[i], lhsState.offsets[i], loc, builder);
-        newLhsOffset =
-            mulOFRs(lhsState.offsets[i], stride, loc, builder);
+        auto stride = expandOFRIndex(lhsState.strides[i], lhsState.offsets[i],
+                                     loc, builder);
+        newLhsOffset = mulOFRs(lhsState.offsets[i], stride, loc, builder);
       }
       auto newRhsOffset = rhsState.offsets[i];
       if (!hasConstZero(rhsState.strides[i])) {
-        auto stride = expandOFRIndex(rhsState.strides[i], rhsState.offsets[i], loc, builder);
-        newRhsOffset =
-            mulOFRs(rhsState.offsets[i], stride, loc, builder);
+        auto stride = expandOFRIndex(rhsState.strides[i], rhsState.offsets[i],
+                                     loc, builder);
+        newRhsOffset = mulOFRs(rhsState.offsets[i], stride, loc, builder);
       }
       // Make sure newLhsOffset and newRhsOffset get same type.
       if (!lhsState.dimIsStructured(i)) {
@@ -338,16 +338,15 @@ void PtrState::dump() const {
   if (isStructured()) {
     llvm::dbgs() << "structured\n";
   } else {
-    for (int i=0;i<getRank();i++) {
+    for (int i = 0; i < getRank(); i++) {
       llvm::dbgs() << "dim " << i;
       if (dimIsStructured(i))
         llvm::dbgs() << " structured\n";
       else
         llvm::dbgs() << " not strucuted\n";
-        
     }
   }
-  
+
   llvm::dbgs() << "\n";
 }
 
@@ -381,8 +380,8 @@ LogicalResult PtrState::mulState(const PtrState &lhsState,
   }
 
   if (lhsState.scalar && rhsState.scalar) {
-    scalar = builder.create<arith::MulIOp>(
-        loc, lhsState.scalar, rhsState.scalar);
+    scalar =
+        builder.create<arith::MulIOp>(loc, lhsState.scalar, rhsState.scalar);
   }
 
   for (uint64_t i = 0; i < lhs->sizes.size(); i++) {
@@ -394,15 +393,15 @@ LogicalResult PtrState::mulState(const PtrState &lhsState,
           mulOFRs(lhs->strides[i], rhs->scalar, loc, builder);
       strides.push_back(newStride);
     } else {
-      auto rhsStride = expandOFRIndex(rhs->scalar, lhs->offsets[i], loc, builder);
+      auto rhsStride =
+          expandOFRIndex(rhs->scalar, lhs->offsets[i], loc, builder);
       OpFoldResult newOffset =
           mulOFRs(lhs->offsets[i], rhsStride, loc, builder);
       offsets.push_back(newOffset);
       // Set stride to 1 when not continuous.
       strides.push_back(builder.getIndexAttr(1));
     }
-    OpFoldResult newShape =
-        mulOFRs(lhs->shape[i], rhs->scalar, loc, builder);
+    OpFoldResult newShape = mulOFRs(lhs->shape[i], rhs->scalar, loc, builder);
     shape.push_back(newShape);
     sizes.push_back(lhs->sizes[i]);
   }
@@ -506,11 +505,19 @@ LogicalResult PtrAnalysis::visitOperandAdd(arith::AddIOp addOp, PtrState &state,
   // Need to clear the modulo and use the operand as offset directly.
   if (!lhsState.isStructured() && rhsState.hasModulo()) {
     // TODO: support modulo in this case.
-    if (rhsState.rebuildAsGatherScatter(addOp.getRhs(), lhsState.getNonStructuredDim()).failed())
+    if (!enableMakeGatherScatterTensorPtr ||
+        rhsState
+            .rebuildAsGatherScatter(addOp.getRhs(),
+                                    lhsState.getNonStructuredDim())
+            .failed())
       return failure();
   } else if (lhsState.hasModulo() && !rhsState.isStructured()) {
-    if (lhsState.rebuildAsGatherScatter(addOp.getLhs(), rhsState.getNonStructuredDim()).failed())
-    return failure();
+    if (!enableMakeGatherScatterTensorPtr ||
+        lhsState
+            .rebuildAsGatherScatter(addOp.getLhs(),
+                                    rhsState.getNonStructuredDim())
+            .failed())
+      return failure();
   }
 
   return state.addState(lhsState, rhsState, addOp, builder);
@@ -533,13 +540,15 @@ LogicalResult PtrAnalysis::visitOperandMul(arith::MulIOp mulOp, PtrState &state,
   // Need to clear the modulo and use the operand as offset directly.
   if (!lhsState.isStructured() && rhsState.hasModulo()) {
     // TODO: support modulo in this case.
-    if (rhsState
+    if (!enableMakeGatherScatterTensorPtr ||
+        rhsState
             .rebuildAsGatherScatter(mulOp.getRhs(),
                                     lhsState.getNonStructuredDim())
             .failed())
       return failure();
   } else if (lhsState.hasModulo() && !rhsState.isStructured()) {
-    if (lhsState
+    if (!enableMakeGatherScatterTensorPtr ||
+        lhsState
             .rebuildAsGatherScatter(mulOp.getLhs(),
                                     rhsState.getNonStructuredDim())
             .failed())
@@ -581,7 +590,7 @@ LogicalResult PtrAnalysis::visitOperandRem(arith::RemSIOp remOp,
   if (state.hasModulo()) {
     remOp->emitRemark(
         "PtrAnalysis: do not support multiple modulo within an expression");
-    if (state.getRank() == 1)
+    if (state.getRank() == 1 && enableMakeGatherScatterTensorPtr)
       // Build the state from the current operation as an unstructured state,
       // but only when there is a single dimension involved.
       return state.rebuildAsGatherScatter(remOp.getResult(), 0);
@@ -1003,6 +1012,8 @@ LogicalResult PtrAnalysis::visitOperand(Value operand, PtrState &state,
                     "unsupported operation\n";
     operand.dump();
 
+    if (!enableMakeGatherScatterTensorPtr)
+      return failure();
     return state.rebuildAsUnsupportedOp(operand);
   }
 }
@@ -1021,13 +1032,16 @@ LogicalResult PtrAnalysis::rewriteAddptrOp(triton::AddPtrOp op) {
     if (state.isStructured()) {
       auto maketptrOp = state.createTTSMakeTensorPtrOp(builder, op.getLoc());
       ptrMap.map(op.getResult(), maketptrOp.getResult());
-    } else {
+    } else if (enableMakeGatherScatterTensorPtr) {
       // If there is only one dimension, return failure since there are no
       // continuous dimensions.
       if (state.getRank() == 1)
         return failure();
-      auto maketptrOp = state.createTTSMakeGatherScatterTensorPtrOp(builder, op.getLoc());
+      auto maketptrOp =
+          state.createTTSMakeGatherScatterTensorPtrOp(builder, op.getLoc());
       ptrMap.map(op.getResult(), maketptrOp.getResult());
+    } else {
+      return failure();
     }
   } else {
     // record the ptr as we have visited and built up the state for this scalar
