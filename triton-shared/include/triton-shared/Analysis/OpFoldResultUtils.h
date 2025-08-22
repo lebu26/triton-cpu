@@ -8,9 +8,9 @@
 #ifndef TRITON_ANALYSIS_OPFOLDRESULT_UTILS_H
 #define TRITON_ANALYSIS_OPFOLDRESULT_UTILS_H
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Location.h"
 #include "mlir/IR/OpDefinition.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
 
 #include <optional>
 
@@ -35,6 +35,9 @@ Value ofrToIndexValue(const OpFoldResult ofr, const Location loc, OpBuilder &b);
 SmallVector<Value> ofrsToIndexValues(ArrayRef<OpFoldResult> ofrs,
                                      const Location loc, OpBuilder &b);
 
+// Expand index to given type.
+OpFoldResult expandOFRIndex(OpFoldResult ofr, OpFoldResult targetOrfForTy,
+                            const Location loc, OpBuilder &b);
 // Process addition of two OFRs. If both OFRs are Integer Attributes, result
 // is an Integer Attribute. Otherwise, insert the arith.addi instruction if
 // needed and use its result Value.
@@ -50,8 +53,8 @@ OpFoldResult subOFRs(const OpFoldResult lhs, const OpFoldResult rhs,
 // Process multiplication of two OFRs. If both OFRs are Integer Attributes,
 // result is an Integer Attribtue. Otherwise, insert the arith.muli
 // instruction if needed and use its result Value.
-OpFoldResult mulOFRValue(const OpFoldResult lhs, const Value rhs,
-                         const Location loc, OpBuilder &b);
+OpFoldResult mulOFRs(const OpFoldResult lhs, const OpFoldResult rhs,
+                     const Location loc, OpBuilder &b);
 
 OpFoldResult minOFRs(const OpFoldResult lhs, const OpFoldResult rhs,
                      const Location loc, OpBuilder &b);
@@ -60,8 +63,10 @@ OpFoldResult maxOFRs(const OpFoldResult lhs, const OpFoldResult rhs,
                      const Location loc, OpBuilder &b);
 
 OpFoldResult compareOFRs(const OpFoldResult lhs, const OpFoldResult rhs,
-                    const arith::CmpIPredicate pred, const OpFoldResult trueVal,
-                    const OpFoldResult falseVal, const Location loc, OpBuilder &b);
+                         const arith::CmpIPredicate pred,
+                         const OpFoldResult trueVal,
+                         const OpFoldResult falseVal, const Location loc,
+                         OpBuilder &b);
 } // namespace mlir
 
 #endif
