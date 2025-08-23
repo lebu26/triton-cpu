@@ -384,8 +384,12 @@ LogicalResult MaskState::parseCmp(arith::CmpIOp cmpOp, const Location loc,
       cmpDim = i;
     }
   }
-  assert(cmpDim != -1 &&
-         "Unexpected case where no dimension has size larger than 1");
+
+  assert(
+      cmpDim != -1 ||
+      (!lhsState.scalar && cmpOp.getPredicate() == arith::CmpIPredicate::slt ||
+       cmpOp.getPredicate() == arith::CmpIPredicate::ult) &&
+          "Unexpected case where no dimension has size larger than 1");
 
   OpFoldResult newDim;
   if (lhsState.scalar) {
@@ -505,6 +509,12 @@ LogicalResult MaskState::parseLoopIterArg(Value v, const Location loc,
       if (failed(lhsState.parse(tritonValue, loc, builder))) {
         return failure();
       }
+    }
+
+    if (!lhsState.start && !lhsState.end) {
+      assert(lhsState.scalar && "MaskState must have a scalar");
+      lhsState.start = builder.getIndexAttr(0);
+      lhsState.end = lhsState.scalar;
     }
 
     auto dist = subOFRs(lhsState.end, lhsState.start, loc, builder);
