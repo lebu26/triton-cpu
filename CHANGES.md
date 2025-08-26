@@ -101,3 +101,12 @@ At a conceptual level, this implementation works as follows:
 * We iterate over all elements of the input tensor(s), treating the scan axis specially.
 * For the first element along the scan axis, the output is initialized directly from the input.
 * For the remaining elements, we load the previous accumulator value, apply the scan operation (which gets clone from the original `tt.scan`), and store the updated result.
+
+
+## [WIP] Fixing tt.storeOp cannot be rewritten
+
+This triton-shared bug is partially fixed in the lastest version as discussed in [this issue](https://github.com/microsoft/triton-shared/issues/311). The code gets lowered to `tptr` and `ptr` dialect however the is not a lowering to LLVM just yet.
+
+To get as close as upstream triton-shared as I could I started looking at the commits and making changes. At the start I tought I would only need commits related to `tptr` but I later tought that including the other could be a good idea too (that's why in my commit history it does not match with the origianl order of triton-shared). In the end I just ended up skipping commits related to triton updates or related to other pieces of code I had already changed myself (like reduction) and made the necessary changes for it to work with the MLIR 19 API.
+
+However, I found a bug where all of my code was getting deleted, after degugging I found the solution in [this upstream commit](https://github.com/llvm/llvm-project/commit/df0d249b6511289f1e8c1389f4fd33d7b4c083fa) so I made [this backport](https://gitee.com/openeuler/llvm-project/pulls/255) to the open euler llvm.
