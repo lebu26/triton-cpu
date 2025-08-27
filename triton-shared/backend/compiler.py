@@ -146,7 +146,7 @@ class CPUBackend(BaseBackend):
             _dump_ir_if_needed([src_path])
             triton_shared_opt_path = _get_triton_shared_opt_path()
             try:
-                subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "-o", dst_path])
+                subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental","--tptr-to-llvm","-o", dst_path])
                 return Path(dst_path).read_text()
             except subprocess.CalledProcessError as e:
                 if ENABLE_FALLBACK:

@@ -14,5 +14,35 @@ add_subdirectory(tools)
 
 if (TRITON_SHARED_BUILD_CPU_BACKEND)
     add_triton_plugin(TritonShared ${CMAKE_CURRENT_SOURCE_DIR}/triton_shared.cc LINK_LIBS TritonSharedAnalysis TritonToLinalg TritonTilingExtIR)
-    target_link_libraries(TritonShared PRIVATE Python3::Module pybind11::headers ${Python3_LIBRARIES})
+    target_link_libraries(TritonShared
+        PRIVATE
+        MLIRAffineToStandard
+        MLIRReconcileUnrealizedCasts
+        MLIRSCFToControlFlow
+
+        MLIRBufferizationTransforms
+        MLIRArithTransforms
+        MLIRMemRefTransforms
+        MLIRSCFTransforms
+        MLIRFuncTransforms
+        MLIRVectorTransforms
+        MLIRTensorTransforms
+
+        MLIRArithToLLVM
+        MLIRIndexToLLVM
+        MLIRMathToLLVM
+        MLIRComplexToLLVM
+        MLIRVectorToLLVM
+        MLIRVectorToLLVMPass
+        MLIRFuncToLLVM
+        MLIRControlFlowToLLVM
+        MLIRMemRefToLLVM
+        MLIRVectorToSCF
+        TPtrToLLVM
+        MLIRUBToLLVM
+
+        Python3::Module
+        pybind11::headers
+        ${Python3_LIBRARIES}
+    )
 endif()

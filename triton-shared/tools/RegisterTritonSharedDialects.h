@@ -4,7 +4,6 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/Ptr/IR/PtrDialect.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "triton-shared/Conversion/StructuredToMemref/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -26,6 +25,8 @@
 #include "triton-shared/Conversion/TritonToUnstructured/Passes.h"
 #include "triton-shared/Dialect/TritonStructured/IR/TritonStructuredDialect.h"
 #include "triton-shared/Dialect/TritonTilingExt/IR/TritonTilingExtDialect.h"
+#include "triton-shared/Conversion/TPtrToLLVM/Passes.h"
+
 
 #include "mlir/InitAllPasses.h"
 
@@ -56,6 +57,8 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerTritonArithToLinalgPasses();
   mlir::triton::registerConvertTritonToTritonGPUPass();
   mlir::triton::registerStructuredToMemrefPasses();
+  mlir::tptr::registerTPtrToLLVM();
+
 
   // TODO: register Triton & TritonGPU passes
   registry.insert<
@@ -66,5 +69,5 @@ inline void registerTritonSharedDialects(mlir::DialectRegistry &registry) {
       mlir::arith::ArithDialect, mlir::scf::SCFDialect, mlir::gpu::GPUDialect,
       mlir::linalg::LinalgDialect, mlir::func::FuncDialect,
       mlir::tensor::TensorDialect, mlir::memref::MemRefDialect,
-      mlir::bufferization::BufferizationDialect>();
+      mlir::bufferization::BufferizationDialect, mlir::LLVM::LLVMDialect>();
 }

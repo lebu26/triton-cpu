@@ -6,3 +6,5 @@ add_subdirectory(TritonPtrToMemref)
 add_subdirectory(TritonToUnstructured)
 add_subdirectory(StructuredToMemref)
 add_subdirectory(UnstructuredToMemref)
+add_subdirectory(TPtrToLLVM)
+

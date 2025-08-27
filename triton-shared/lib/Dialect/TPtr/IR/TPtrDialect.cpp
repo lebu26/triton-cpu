@@ -4,6 +4,11 @@
 
 #include "mlir/Dialect/Ptr/IR/PtrDialect.h"
 #include "mlir/Dialect/Ptr/IR/PtrTypes.h"
+#include "llvm/ADT/TypeSwitch.h"
+#include "mlir/IR/DialectImplementation.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Types.h"
+
 
 #define GET_TYPEDEF_CLASSES
 #include "triton-shared/Dialect/TPtr/IR/TPtrTypes.cpp.inc"
@@ -23,6 +28,17 @@ void printIntType(OpAsmPrinter &p, Operation *op, Type ty) {
     p << " : " << ty;
 }
 } // namespace
+
+mlir::Attribute tptr::TPtrDialect::parseAttribute(
+    mlir::DialectAsmParser &parser, mlir::Type type) const {
+  parser.emitError(parser.getNameLoc(), "no dialect attributes are supported");
+  return {};
+}
+
+void tptr::TPtrDialect::printAttribute(mlir::Attribute attr,
+                                       mlir::DialectAsmPrinter &printer) const {
+  llvm_unreachable("no dialect attributes are supported");
+}
 
 //===----------------------------------------------------------------------===//
 // Dialect
