@@ -110,3 +110,10 @@ This triton-shared bug is partially fixed in the lastest version as discussed in
 To get as close as upstream triton-shared as I could I started looking at the commits and making changes. At the start I tought I would only need commits related to `tptr` but I later tought that including the other could be a good idea too (that's why in my commit history it does not match with the origianl order of triton-shared). In the end I just ended up skipping commits related to triton updates or related to other pieces of code I had already changed myself (like reduction) and made the necessary changes for it to work with the MLIR 19 API.
 
 However, I found a bug where all of my code was getting deleted, after degugging I found the solution in [this upstream commit](https://github.com/llvm/llvm-project/commit/df0d249b6511289f1e8c1389f4fd33d7b4c083fa) so I made [this backport](https://gitee.com/openeuler/llvm-project/pulls/255) to the open euler llvm.
+
+
+Now I used the code in [this PR](https://github.com/microsoft/triton-shared/pull/325) that lower `tptr` to llvm as the `ptr` dialect in MLIR is not developed enough even in upstream. However, adding a `lower-to-llvm` pass to triton-shared implies that we need to start using `triton-shared-opt` instead of `mlir-opt` in the middle of the pipeline as now we are mixing standard MLIR + `tptr` in this situation.
+
+To do that I introduced the needed passes to the Python API in `triton_shared.cc`, I also needed to introduce changes to some of the `CMakeLists.txt`, I used the official LLVM `mlir-opt.cpp` as a reference. 
+
+After that almost all of the code lowered but there are some `memref.dealloc` still in the final code. This happends because tehy have `!ptr.ptr` type and there is no know way to lower that to llvm.free as referenced in [this issue](https://github.com/llvm/llvm-project/issues/156006)

@@ -27,6 +27,9 @@ if (TRITON_SHARED_BUILD_CPU_BACKEND)
         MLIRFuncTransforms
         MLIRVectorTransforms
         MLIRTensorTransforms
+        MLIRTransformDialectTransforms
+        MLIRTransformDialect
+        MLIRTransformUtils
 
         MLIRArithToLLVM
         MLIRIndexToLLVM

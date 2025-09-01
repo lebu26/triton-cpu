@@ -1,5 +1,5 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, CPUFallbackException
-from triton._C.libtriton import ir, passes, cpu, llvm
+from triton._C.libtriton import ir, passes, cpu, llvm, triton_shared
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple, Optional
 from types import ModuleType
@@ -146,13 +146,27 @@ class CPUBackend(BaseBackend):
             _dump_ir_if_needed([src_path])
             triton_shared_opt_path = _get_triton_shared_opt_path()
             try:
-                subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental","--tptr-to-llvm","-o", dst_path])
+                subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental","-o", dst_path])
                 return Path(dst_path).read_text()
             except subprocess.CalledProcessError as e:
                 if ENABLE_FALLBACK:
                     print("TritonShared-MLIR optimization failed, falling back to CPU backend")
                     os.environ["TRITON_USE_SHARED_BACKEND"] = "0"
                     raise CPUFallbackException
+            '''
+            context = ir.context()
+            triton_shared.ir.load_dialects(context)
+            triton_shared.debug.print_context_ops(context)
+            pm = ir.pass_manager(context)
+
+            triton_shared.to_ttsharedir.add_triton_to_linalg_experimental(pm)
+            pm.run(mod)
+            
+            Path(dst_path).write_text(str(mod))
+            '''
+            
+            
+            return Path(dst_path).read_text()
 
 
 
@@ -585,6 +599,7 @@ class CPUBackend(BaseBackend):
         body_lines = []
         in_body = False
         brace_balance = 0
+        output = "#loc = loc(unknown)\n"
 
         for line in lines:
             if not in_body:
@@ -611,7 +626,7 @@ class CPUBackend(BaseBackend):
         dedented_body = textwrap.dedent(''.join(body_lines)).strip() + '\n'
 
         # Combine declarations and body
-        output = ''.join(decl_lines).strip()
+        output += ''.join(decl_lines).strip()
         if decl_lines:
             output += '\n\n'
         output += dedented_body
@@ -627,20 +642,37 @@ class CPUBackend(BaseBackend):
             llmlir_path = os.path.join(tmpdir, "ll.mlir")
             llir_path = os.path.join(tmpdir, "ll.ir")
             Path(ttshared_path).write_text(ttsharedir)
-            mlir_opt_path = _get_llvm_bin_path("mlir-opt")
+            _dump_ir_if_needed([ttshared_path])
+            context = ir.context()
+            triton_shared.ir.load_dialects(context)
+            mod = ir.parse_mlir_module(ttshared_path, context)
 
+            pm = ir.pass_manager(context)
+            #pm.enable_debug()
+            
             if FORCE_SME or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
-                pipeline = [
-                "--transform-interpreter",
-                "--test-transform-dialect-erase-schedule",
-                ]
+                triton_shared.to_llir.add_transform_interpreter(pm)
             elif FORCE_SVE or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
-                pipeline = [
-                "--transform-interpreter",
-                "--test-transform-dialect-erase-schedule",
-                "--convert-vector-to-llvm=\"enable-arm-sve\"",
-                "--test-lower-to-llvm",
-                ]
+                triton_shared.to_llir.add_transform_interpreter(pm)
+                triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm)
+                triton_shared.to_llir.add_convert_vector_to_llvm_with_sve(pm)
+                ## lowering to LLVM
+                triton_shared.to_llir.add_convert_vector_to_scf(pm)
+                triton_shared.to_llir.add_convert_linalg_to_loops(pm)
+                triton_shared.to_llir.add_lower_affine(pm)
+                triton_shared.to_llir.add_convert_scf_to_cf(pm)
+                triton_shared.to_llir.add_canonicalizer(pm)
+                triton_shared.to_llir.add_cse(pm)
+                triton_shared.to_llir.add_convert_math_to_llvm(pm)
+                triton_shared.to_llir.add_expand_strided_metadata(pm)
+                triton_shared.to_llir.add_lower_affine(pm)
+                triton_shared.to_llir.add_convert_tptr_to_llvm(pm)
+                triton_shared.to_llir.add_convert_to_llvm(pm)
+                triton_shared.to_llir.add_finalize_memref_to_llvm(pm)
+                triton_shared.to_llir.add_convert_func_to_llvm(pm)
+                triton_shared.to_llir.add_convert_index_to_llvm(pm)
+                triton_shared.to_llir.add_reconcile_unrealized_casts(pm)
+                triton_shared.to_llir.add_strip_debug_info(pm)
             else:
                 pipeline = [
                 "--convert-linalg-to-affine-loops",
@@ -654,20 +686,12 @@ class CPUBackend(BaseBackend):
                 "--reconcile-unrealized-casts",
                 ]
            
-            _dump_ir_if_needed([ttshared_path])
+            pm.run(mod)
+            Path(llmlir_path).write_text(str(mod))
+           
             # TritonShared-MLIR to LLVM-MLIR
-
-            try:
-                subprocess.check_call([mlir_opt_path, ttshared_path] + pipeline + [ "-o", llmlir_path])
-            except subprocess.CalledProcessError as e:
-                if ENABLE_FALLBACK:
-                    print("TritonShared-MLIR optimization failed, falling back to CPU backend")
-                    os.environ["TRITON_USE_SHARED_BACKEND"] = "0"
-                    raise CPUFallbackException
-            
-
-            _dump_ir_if_needed([llmlir_path])
             self._extract_mlir_function(llmlir_path)
+            _dump_ir_if_needed([llmlir_path])
             # LLVM-MLIR to LLVM-IR
             mlir_translate_path = _get_llvm_bin_path("mlir-translate")
             subprocess.check_call([mlir_translate_path, llmlir_path,
