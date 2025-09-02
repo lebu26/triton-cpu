@@ -147,11 +147,6 @@ public:
     target.addDynamicallyLegalOp<memref::AllocOp>([&](memref::AllocOp op) {
       auto memrefType = op.getType();
       auto elementType = memrefType.getElementType();
-      if (isa<ptr::PtrType>(elementType)) {
-        LDBG("AllocOp marked illegal due to pointer element type: "
-             << elementType);
-        return false;
-      }
       return true;
     });
 
@@ -159,11 +154,6 @@ public:
       auto memrefType = op.getMemRef().getType();
       if (auto memrefTy = dyn_cast<MemRefType>(memrefType)) {
         auto elementType = memrefTy.getElementType();
-        if (isa<ptr::PtrType>(elementType)) {
-          LDBG("StoreOp marked illegal due to pointer element type: "
-               << elementType);
-          return false;
-        }
       }
       return true;
     });
@@ -172,11 +162,6 @@ public:
       auto memrefType = op.getMemRef().getType();
       if (auto memrefTy = dyn_cast<MemRefType>(memrefType)) {
         auto elementType = memrefTy.getElementType();
-        if (isa<ptr::PtrType>(elementType)) {
-          LDBG("LoadOp marked illegal due to pointer element type: "
-               << elementType);
-          return false;
-        }
       }
       return true;
     });

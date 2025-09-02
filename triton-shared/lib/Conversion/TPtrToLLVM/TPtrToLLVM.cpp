@@ -610,8 +610,7 @@ void populateTPtrToLLVMConversionPatterns(RewritePatternSet &patterns,
                                           TypeConverter &typeConverter) {
   patterns.add<TypeOffsetConverter, PtrAddConverter, FromMemrefConverter,
                ConvertBranchOp, ConvertControlFlowOp, ToMemrefConverter,
-               UnrealizedCastConverter, MemRefAllocConverter,
-               MemRefStoreConverter, MemRefLoadConverter>(
+               UnrealizedCastConverter>(
       typeConverter, patterns.getContext());
 }
 

@@ -25,6 +25,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Ptr/IR/PtrDialect.h"
 #include "mlir/Dialect/Ptr/IR/PtrTypes.h"
+#include "mlir/Dialect/Ptr/IR/PtrAttrs.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -100,7 +101,7 @@ struct EmptyTensorConverter : public OpConversionPattern<tensor::EmptyOp> {
     op, op.getType().getShape(),
     ptr::PtrType::get(
             rewriter.getContext(),
-            tptr::DefaultMemorySpaceAttr::get(rewriter.getContext())));
+            ptr::GenericSpaceAttr::get(rewriter.getContext())));
     return success();
   }
 };
@@ -189,7 +190,7 @@ struct AddPtrConverter : public OpConversionPattern<triton::AddPtrOp> {
         op,
         ptr::PtrType::get(
             rewriter.getContext(),
-            tptr::DefaultMemorySpaceAttr::get(rewriter.getContext())),
+            ptr::GenericSpaceAttr::get(rewriter.getContext())),
         adaptor.getPtr(), scaledOffset);
     return success();
   }
@@ -327,7 +328,7 @@ struct IntToPtrConverter : public OpConversionPattern<triton::IntToPtrOp> {
         op,
         ptr::PtrType::get(
             rewriter.getContext(),
-            tptr::DefaultMemorySpaceAttr::get(rewriter.getContext())),
+            ptr::GenericSpaceAttr::get(rewriter.getContext())),
         adaptor.getSrc());
     return success();
   }
@@ -418,14 +419,14 @@ public:
     addConversion([](Type type) { return type; });
     addConversion([context](triton::PointerType ptrType) {
       return ptr::PtrType::get(context,
-                               tptr::DefaultMemorySpaceAttr::get(context));
+                               ptr::GenericSpaceAttr::get(context));
     });
     addConversion([context](RankedTensorType tensorType) {
       if (isa<triton::PointerType>(tensorType.getElementType())) {
         return RankedTensorType::get(
             tensorType.getShape(),
             ptr::PtrType::get(context,
-                              tptr::DefaultMemorySpaceAttr::get(context)));
+                              ptr::GenericSpaceAttr::get(context)));
       }
       return tensorType;
     });
