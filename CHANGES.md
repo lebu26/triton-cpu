@@ -103,7 +103,7 @@ At a conceptual level, this implementation works as follows:
 * For the remaining elements, we load the previous accumulator value, apply the scan operation (which gets clone from the original `tt.scan`), and store the updated result.
 
 
-## [WIP] Fixing tt.storeOp cannot be rewritten
+## Fixing tt.storeOp cannot be rewritten
 
 This triton-shared bug is partially fixed in the lastest version as discussed in [this issue](https://github.com/microsoft/triton-shared/issues/311). The code gets lowered to `tptr` and `ptr` dialect however the is not a lowering to LLVM just yet.
 
@@ -116,4 +116,8 @@ Now I used the code in [this PR](https://github.com/microsoft/triton-shared/pull
 
 To do that I introduced the needed passes to the Python API in `triton_shared.cc`, I also needed to introduce changes to some of the `CMakeLists.txt`, I used the official LLVM `mlir-opt.cpp` as a reference. 
 
-After that almost all of the code lowered but there are some `memref.dealloc` still in the final code. This happends because tehy have `!ptr.ptr` type and there is no know way to lower that to llvm.free as referenced in [this issue](https://github.com/llvm/llvm-project/issues/156006)
+After that almost all of the code lowered but there are some `memref.dealloc` still in the final code. This happends because they have `!ptr.ptr` type and there is no know way to lower that to llvm.free as referenced in [this issue](https://github.com/llvm/llvm-project/issues/156006).
+
+After [backporting some more LLVM code](https://gitee.com/openeuler/llvm-project/pulls/266) to be able to handle `memref.dealloc` I started getting `invalid free` error. Debugging it I found that the problem is not realted to LLVm but rather to `tptr-to-llvm` that has `MemRefAllocConverter`, `MemRefLoadConverter` and `MemRefStoreConverter` which target memrefs with `ptr` type, those rewrites were generating wrong code as `memref.allocOp` was being rewritten to `llvm.alloca` which is wrong since they use heap and stack memory respectively, creating the `invalidad free` error when trying to free stack memory.
+
+I removed those rewrites and made sure to use the `TypeConverter` I backported from LLVM making this error finally go away and passing another group of test. For a closer look there is [This comment I made](https://github.com/microsoft/triton-shared/pull/325#issuecomment-3245391988) on the triton-shared repo.
