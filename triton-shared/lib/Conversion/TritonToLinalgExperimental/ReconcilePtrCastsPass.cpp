@@ -15,22 +15,30 @@
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Ptr/IR/PtrAttrs.h"
 #include "mlir/Dialect/Ptr/IR/PtrTypes.h"
-#include "mlir/Dialect/Ptr/IR/PtrAttrs.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton-shared/Conversion/TritonToLinalgExperimental/ReconcilePtrCasts.h"
 
 #include "triton-shared/Conversion/TritonToLinalgExperimental/ReconcilePtrCasts.h"
 #include "triton-shared/Dialect/TPtr/IR/TPtrDialect.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
+
+#include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
+#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 
 using namespace mlir;
 using namespace triton;
@@ -83,6 +91,7 @@ struct FromMemrefConverter
       return failure();
     }
 
+    Location loc = op.getLoc();
     auto input = op.getInputs().front();
     auto unrankedInput = dyn_cast<UnrankedMemRefType>(input.getType());
     auto output = op.getResult(0);
@@ -91,14 +100,31 @@ struct FromMemrefConverter
     if (unrankedInput && isa<triton::PointerType, ptr::PtrType>(outType)) {
       // from_memref only takes ranked memref, cast the unranked memref to
       // ranked memref first.
-      auto rankedMemref = rewriter.create<memref::CastOp>(
+      Type elementTy;
+      if (auto ttPtr = dyn_cast<triton::PointerType>(outType))
+        elementTy = ttPtr.getPointeeType();
+      else if (auto genericPtr = dyn_cast<ptr::PtrType>(outType))
+        elementTy = genericPtr.getElementType();
+      else
+        return failure();
+
+      Value rankedMemref = rewriter.create<memref::CastOp>(
           op.getLoc(), MemRefType::get({1}, unrankedInput.getElementType()),
           input);
+
+      if (elementTy && elementTy != unrankedInput.getElementType()) {
+        // Insert an unrealized conversion cast to match element type
+        auto castOp = rewriter.create<UnrealizedConversionCastOp>(
+            loc, MemRefType::get({1}, elementTy), rankedMemref);
+
+        // Use the result of the cast op
+        rankedMemref = castOp.getResult(0);
+      }
+
       auto memrefToPtr = rewriter.create<tptr::FromMemrefOp>(
           op->getLoc(),
-          ptr::PtrType::get(
-              rewriter.getContext(),
-              ptr::GenericSpaceAttr::get(rewriter.getContext())),
+          ptr::PtrType::get(rewriter.getContext(),
+                            ptr::GenericSpaceAttr::get(rewriter.getContext())),
           rankedMemref);
 
       rewriter.replaceAllUsesWith(output, memrefToPtr);
@@ -147,22 +173,141 @@ struct ToMemrefConverter : public OpRewritePattern<UnrealizedConversionCastOp> {
   }
 };
 
+static std::optional<arith::AtomicRMWKind> mapTritonToMLIR(uint32_t triKind) {
+  switch (triKind) {
+  case 1:
+    return arith::AtomicRMWKind::andi; // Triton AND
+  case 2:
+    return arith::AtomicRMWKind::ori; // Triton OR
+  case 3:
+    return std::nullopt; // Triton XOR not supported
+  case 4:
+    return arith::AtomicRMWKind::addi; // Triton ADD
+  case 5:
+    return arith::AtomicRMWKind::addf; // Triton FADD
+  case 6:
+    return arith::AtomicRMWKind::maxs; // Triton signed max
+  case 7:
+    return arith::AtomicRMWKind::mins; // Triton signed min
+  case 8:
+    return arith::AtomicRMWKind::maxu; // Triton unsigned max
+  case 9:
+    return arith::AtomicRMWKind::minu; // Triton unsigned min
+  case 10:
+    return arith::AtomicRMWKind::assign; // Triton XCHG → assign
+  default:
+    return std::nullopt;
+  }
+}
+
+struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(triton::AtomicRMWOp op,
+                                PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto val = op.getVal();
+    auto tritonPtr = op.getPtr();
+    auto mask = op.getMask();
+
+    // Recover memref from Triton pointer
+    Value memref;
+    if (auto fromMemref = tritonPtr.getDefiningOp<tptr::FromMemrefOp>())
+      memref = fromMemref.getOperand();
+    else if (tritonPtr.getType().isa<TensorType>()) {
+      // in this case we need to map it to memref.generic_atomic_rmw instead and
+      // create a body for it
+      return rewriter.notifyMatchFailure(op, "unuspported tensor for atomic");
+    } else {
+      return rewriter.notifyMatchFailure(op, "unsupported Triton pointer");
+    }
+
+    // Get Triton's atomic kind integer
+    auto kindIntAttr = op->getAttrOfType<IntegerAttr>("atomic_rmw_op");
+    if (!kindIntAttr)
+      return rewriter.notifyMatchFailure(op, "missing Triton atomic kind");
+
+    uint32_t triKind = kindIntAttr.getInt();
+    auto mlirKindOpt = mapTritonToMLIR(triKind);
+    if (!mlirKindOpt)
+      return rewriter.notifyMatchFailure(op, "unsupported Triton atomic kind");
+
+    auto kindAttr =
+        arith::AtomicRMWKindAttr::get(rewriter.getContext(), *mlirKindOpt);
+
+    // Use index 0 for rank-1 memrefs for now
+    Value idx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    SmallVector<Value, 1> indices{idx};
+
+    Value atomic;
+
+    if (mask) {
+      auto ifOp = rewriter.create<scf::IfOp>(
+          loc, 
+          mask,
+          /*thenBuilder=*/
+          [&](OpBuilder &b, Location l) {
+            atomic = b.create<memref::AtomicRMWOp>(
+                l, kindAttr, val, memref, indices);
+            b.create<scf::YieldOp>(l);
+          },
+          /*elseBuilder=*/
+          [&](OpBuilder &b, Location l) { b.create<scf::YieldOp>(l); });
+
+        rewriter.replaceOp(op, atomic);
+    }else{
+      // Replace with memref.atomic_rmw
+      rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kindAttr, val, memref,
+                                                       indices);
+    }
+
+    return success();
+  }
+};
+
 class ReconcilePtrCastsPass
     : public ReconcilePtrCastsBase<ReconcilePtrCastsPass> {
 
 public:
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<tptr::TPtrDialect, memref::MemRefDialect, BuiltinDialect>();
+    registry.insert<tptr::TPtrDialect, memref::MemRefDialect, BuiltinDialect,
+                    arith::ArithDialect>();
   }
 
   void runOnOperation() override {
     auto moduleOp = getOperation();
-    RewritePatternSet patterns(&getContext());
-    patterns
-        .add<SimplifyUnrealizedCast, FromMemrefConverter, ToMemrefConverter>(
-            &getContext());
-    if (failed(applyPatternsAndFoldGreedily(moduleOp, std::move(patterns)))) {
-      signalPassFailure();
+
+    // === Phase 1: Greedy rewrites ===
+    {
+      RewritePatternSet greedyPatterns(&getContext());
+      greedyPatterns
+          .add<SimplifyUnrealizedCast, FromMemrefConverter, ToMemrefConverter>(
+              &getContext());
+
+      if (failed(applyPatternsAndFoldGreedily(moduleOp,
+                                              std::move(greedyPatterns)))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
+    // === Phase 2: Conversion patterns ===
+    {
+      RewritePatternSet conversionPatterns(&getContext());
+      conversionPatterns.add<AtomicrmwConverter>(&getContext());
+
+      ConversionTarget target(getContext());
+      target.addIllegalOp<triton::AtomicRMWOp>();
+      target.addLegalDialect<arith::ArithDialect>();
+      target.addLegalDialect<memref::MemRefDialect>();
+      target.addLegalDialect<BuiltinDialect>();
+      target.addLegalDialect<scf::SCFDialect>();
+
+      if (failed(applyPartialConversion(moduleOp, target,
+                                        std::move(conversionPatterns)))) {
+        signalPassFailure();
+        return;
+      }
     }
   }
 };
