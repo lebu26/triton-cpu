@@ -20,8 +20,8 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Ptr/IR/PtrAttrs.h"
 #include "mlir/Dialect/Ptr/IR/PtrTypes.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -207,20 +207,8 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
                                 PatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
     auto val = op.getVal();
-    auto tritonPtr = op.getPtr();
+    Value tritonPtr = op.getPtr();
     auto mask = op.getMask();
-
-    // Recover memref from Triton pointer
-    Value memref;
-    if (auto fromMemref = tritonPtr.getDefiningOp<tptr::FromMemrefOp>())
-      memref = fromMemref.getOperand();
-    else if (tritonPtr.getType().isa<TensorType>()) {
-      // in this case we need to map it to memref.generic_atomic_rmw instead and
-      // create a body for it
-      return rewriter.notifyMatchFailure(op, "unuspported tensor for atomic");
-    } else {
-      return rewriter.notifyMatchFailure(op, "unsupported Triton pointer");
-    }
 
     // Get Triton's atomic kind integer
     auto kindIntAttr = op->getAttrOfType<IntegerAttr>("atomic_rmw_op");
@@ -235,6 +223,118 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
     auto kindAttr =
         arith::AtomicRMWKindAttr::get(rewriter.getContext(), *mlirKindOpt);
 
+    // Recover memref from Triton pointer
+    Value memref;
+    if (auto fromMemref = tritonPtr.getDefiningOp<tptr::FromMemrefOp>())
+      memref = fromMemref.getOperand();
+    else if (auto tensorType =
+                 dyn_cast<RankedTensorType>(tritonPtr.getType())) {
+      // shapes and rank
+      SmallVector<int64_t> shape(tensorType.getShape().begin(),
+                                 tensorType.getShape().end());
+      unsigned rank = tensorType.getRank();
+
+      // pointer element type (e.g. !tt.ptr<f32> or !ptr.ptr<#...>)
+      Type lanePtrElemTy = tensorType.getElementType();
+      Type pointeeTy = nullptr;
+      if (auto ttPtr = mlir::dyn_cast<triton::PointerType>(lanePtrElemTy)) {
+        pointeeTy = ttPtr.getPointeeType();
+      } else if (auto genericPtr =
+                     mlir::dyn_cast<ptr::PtrType>(lanePtrElemTy)) {
+        pointeeTy = genericPtr.getElementType();
+      } else {
+        return rewriter.notifyMatchFailure(op,
+                                           "unsupported pointer element type");
+      }
+
+      // the result tensor type should match 'val'
+      auto resultTensorTy = val.getType().dyn_cast<RankedTensorType>();
+      if (!resultTensorTy)
+        return rewriter.notifyMatchFailure(
+            op, "expected ranked tensor as value/result");
+
+      // === 2) Prepare loop bounds as Values (ValueRange expected by
+      // buildLoopNest) ===
+      SmallVector<Value> lbs, ubs, steps;
+      lbs.reserve(rank);
+      ubs.reserve(rank);
+      steps.reserve(rank);
+      for (unsigned i = 0; i < rank; ++i) {
+        lbs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 0));
+        // shape[i] may be dynamic (-1) — for static shapes we use constant
+        // index; if dynamic, you'd need to materialize the dynamic bound. Here
+        // we assume static.
+        if (shape[i] == ShapedType::kDynamic) {
+          return rewriter.notifyMatchFailure(
+              op, "dynamic shapes not supported in lowering yet");
+        }
+        ubs.push_back(rewriter.create<arith::ConstantIndexOp>(loc, shape[i]));
+        steps.push_back(rewriter.create<arith::ConstantIndexOp>(loc, 1));
+      }
+
+      // === 3) Allocate a result memref to collect scalar results per-lane ===
+      Type resultElemTy = resultTensorTy.getElementType();
+
+      // 1) Create an empty tensor to accumulate results
+      Value resultEmpty = rewriter.create<tensor::EmptyOp>(
+          loc,
+          SmallVector<int64_t>(tensorType.getShape().begin(),
+                               tensorType.getShape().end()),
+          resultTensorTy.getElementType());
+
+      scf::LoopNest nest = scf::buildLoopNest(
+          rewriter, loc, lbs, ubs, steps,
+          /*iterArgs=*/ValueRange{resultEmpty},
+          [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange ivs,
+              ValueRange iterArgs) -> scf::ValueVector {
+            // iterArgs[0] = current accumulator tensor
+            Value currentTensor = iterArgs[0];
+
+            // Unwrap pointer tensor if necessary
+            Value ttPtr = tritonPtr;
+            if (auto cast =
+                    tritonPtr.getDefiningOp<UnrealizedConversionCastOp>())
+              ttPtr = cast.getOperand(0);
+
+            // 1. Extract pointer element for this lane
+            Value lanePtr =
+                nestedBuilder.create<tensor::ExtractOp>(nestedLoc, ttPtr, ivs);
+
+            // 2. Convert lane pointer to memref<1xf32>
+            auto elemTy = val.getType().cast<RankedTensorType>().getElementType();
+            Value laneMemref = nestedBuilder.create<tptr::ToMemrefOp>(
+                nestedLoc, MemRefType::get({1}, elemTy), lanePtr);
+
+            // 3. Extract the value element for this lane
+            Value laneVal =
+                nestedBuilder.create<tensor::ExtractOp>(nestedLoc, val, ivs);
+
+            // 4. Perform the atomic RMW op
+            Value zeroIdx =
+                nestedBuilder.create<arith::ConstantIndexOp>(nestedLoc, 0);
+            SmallVector<Value, 1> memIndices{zeroIdx};
+            auto atomic = nestedBuilder.create<memref::AtomicRMWOp>(
+                nestedLoc, kindAttr, laneVal, laneMemref, memIndices);
+
+            // 5. Insert the atomic result back into the current tensor
+            Value updatedTensor = nestedBuilder.create<tensor::InsertOp>(
+                nestedLoc, atomic.getResult(), currentTensor, ivs);
+
+            // Yield the updated tensor as the new iter_arg
+            return {updatedTensor};
+          });
+
+      // Use the loop result as the final tensor
+      Value resultTensor = nest.results.front();
+
+      // Replace the Triton op with the result tensor
+      rewriter.replaceOp(op, resultTensor);
+      return success();
+
+    } else {
+      return rewriter.notifyMatchFailure(op, "unsupported Triton pointer");
+    }
+
     // Use index 0 for rank-1 memrefs for now
     Value idx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     SmallVector<Value, 1> indices{idx};
@@ -243,22 +343,21 @@ struct AtomicrmwConverter : public OpRewritePattern<triton::AtomicRMWOp> {
 
     if (mask) {
       auto ifOp = rewriter.create<scf::IfOp>(
-          loc, 
-          mask,
+          loc, mask,
           /*thenBuilder=*/
           [&](OpBuilder &b, Location l) {
-            atomic = b.create<memref::AtomicRMWOp>(
-                l, kindAttr, val, memref, indices);
+            atomic = b.create<memref::AtomicRMWOp>(l, kindAttr, val, memref,
+                                                   indices);
             b.create<scf::YieldOp>(l);
           },
           /*elseBuilder=*/
           [&](OpBuilder &b, Location l) { b.create<scf::YieldOp>(l); });
 
-        rewriter.replaceOp(op, atomic);
-    }else{
+      rewriter.replaceOp(op, atomic);
+    } else {
       // Replace with memref.atomic_rmw
-      rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kindAttr, val, memref,
-                                                       indices);
+      rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kindAttr, val,
+                                                       memref, indices);
     }
 
     return success();
@@ -300,8 +399,10 @@ public:
       target.addIllegalOp<triton::AtomicRMWOp>();
       target.addLegalDialect<arith::ArithDialect>();
       target.addLegalDialect<memref::MemRefDialect>();
-      target.addLegalDialect<BuiltinDialect>();
       target.addLegalDialect<scf::SCFDialect>();
+      target.addLegalDialect<tensor::TensorDialect>();
+      target.addLegalDialect<tptr::TPtrDialect>();
+      target.addLegalDialect<BuiltinDialect>();
 
       if (failed(applyPartialConversion(moduleOp, target,
                                         std::move(conversionPatterns)))) {
