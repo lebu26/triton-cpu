@@ -121,3 +121,14 @@ After that almost all of the code lowered but there are some `memref.dealloc` st
 After [backporting some more LLVM code](https://gitee.com/openeuler/llvm-project/pulls/266) to be able to handle `memref.dealloc` I started getting `invalid free` error. Debugging it I found that the problem is not related to LLVM but rather to `tptr-to-llvm` that has `MemRefAllocConverter`, `MemRefLoadConverter` and `MemRefStoreConverter` which target memrefs with `ptr` type, those rewrites were generating wrong code as `memref.allocOp` was being rewritten to `llvm.alloca` which is wrong since they use heap and stack memory respectively, creating the `invalidad free` error when trying to free stack memory.
 
 I removed those rewrites and made sure to use the `TypeConverter` I backported from LLVM making this error finally go away and passing another group of test. For a closer look there is [This comment I made](https://github.com/microsoft/triton-shared/pull/325#issuecomment-3245391988) on the triton-shared repo.
+
+## Adding support for tt.atomic_rmw
+
+To add support to this operation I did a conversion pass in the file `ReconcilePtrCastsPass.cpp` that made the conversion from `tt.atomic_rmw` to `memref.atomic_rmw` I also needed to [backport some commits]() to fix a bug found in the `remove-dead-values` pass that was crashing the pipeline.
+
+for the tests called `test_atomic_rmw` the conversion was quite straight forward as those test only read-modify-write a single value. But, for the tests called `test_tensor_atomic_rmw` the conversion was harder as triton enables read-modify-write for whole tensors and that is not possible in MLIR so I took the same approach as before but adding a loop and some other conversion around the `memref.atomic_rmw` for it to iterate trough each element.
+
+
+## Adding support for tt.dot with 3d tensors
+
+To add support to this operation I just checked the rank of the tensors in the `MatmulConverter` in `ConversionPatterns.hpp` and if it's 3d the it replaces the op for a `linalg.batch_matmul` instead of a normal matmul.

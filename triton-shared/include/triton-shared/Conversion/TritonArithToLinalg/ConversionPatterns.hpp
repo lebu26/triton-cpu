@@ -1144,6 +1144,8 @@ struct MatmulConverter : public OpConversionPattern<triton::DotOp> {
     auto elementType = dstType.getElementType();
     bool integers = elementType.isInteger();
     bool skipC = isZeroTensor(opc, integers);
+
+    // Initialize result tensor with zeros
     auto init =
         rewriter.create<tensor::EmptyOp>(loc, dstType.getShape(), elementType);
     TypedAttr constantAttr =
@@ -1158,11 +1160,27 @@ struct MatmulConverter : public OpConversionPattern<triton::DotOp> {
         rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{init})
             .result();
 
-    auto res = rewriter
-                   .create<linalg::MatmulOp>(loc, ValueRange{opa, opb},
-                                             ValueRange{zeroes})
-                   .getResult(0);
+    Value res;
+    auto rank = dstType.getRank();
 
+    if (rank == 2) {
+      // Standard matmul
+      res = rewriter
+                .create<linalg::MatmulOp>(loc, ValueRange{opa, opb},
+                                          ValueRange{zeroes})
+                .getResult(0);
+    } else if (rank == 3) {
+      // Batched matmul
+      res = rewriter
+                .create<linalg::BatchMatmulOp>(loc, ValueRange{opa, opb},
+                                               ValueRange{zeroes})
+                .getResult(0);
+    } else {
+      return rewriter.notifyMatchFailure(
+          op, "Only 2D or 3D inputs supported for tt.dot lowering");
+    }
+
+    // Add C if it's not zero
     if (!skipC) {
       if (integers) {
         res = rewriter.create<arith::AddIOp>(loc, opc, res);
