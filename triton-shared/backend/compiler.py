@@ -14,6 +14,7 @@ import textwrap
 from pathlib import Path
 from mlir.ir import *
 from mlir.dialects import transform
+from mlir.dialects import pdl
 from mlir.dialects.transform import pdl as transform_pdl
 from mlir.dialects.transform import structured, loop, vector, bufferization, tensor
 
@@ -171,6 +172,677 @@ class CPUBackend(BaseBackend):
 
 
     def _sve_transform(self, src: str) -> str:
+
+        def ew_2d_tile_pad_schedule():
+            sequence = transform.NamedSequenceOp(
+                "ew_2d_tile_pad_schedule",
+                [transform.AnyOpType.get()],
+                [transform.AnyOpType.get()],
+                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
+            )
+            with InsertionPoint(sequence.body):
+                withPdl = transform_pdl.WithPDLPatternsOp(pdl.OperationType.get())
+                with InsertionPoint(withPdl.body):
+                    pattern = pdl.PatternOp(1, "is2DElementwise")
+                    with InsertionPoint(pattern.body):
+                        operands = pdl.OperandsOp()
+                        ty = pdl.TypesOp()
+                        newOp = pdl.OperationOp(name="linalg.generic", args=[operands], types=[ty]) 
+                        attr = pdl.AttributeOp(value=Attribute.parse('{ndim = 2 : i64, operand_number = 1 : i64}'))
+                        pdl.ApplyNativeConstraintOp([], "checkOperandNDim", args=[operands, attr])
+                        pdl.ApplyNativeConstraintOp([], "isElementwiseLinalgOp", args=[newOp])
+                        pdl.RewriteOp(newOp, name="transform.dialect")
+
+                    pdl_seq = transform.SequenceOp(transform.FailurePropagationMode.Propagate, [], withPdl.bodyTarget)
+                    with InsertionPoint(pdl_seq.body):
+                        matched = structured.MatchOp.match_op_names(
+                            pdl.OperationType.get(),
+                            pdl_seq.bodyTarget,
+                            ["linalg.mul"]
+                        )
+                        generalize = structured.GeneralizeOp(matched.result)
+                        funcs = structured.MatchOp.match_op_names(
+                            pdl.OperationType.get(),
+                            pdl_seq.bodyTarget,
+                            ["func.func"]
+                        )
+                        with InsertionPoint(transform.ApplyPatternsOp(funcs).patterns):
+                            structured.apply_patterns_linalg_erase_unnecessary_inputs()
+
+                        match = transform_pdl.PDLMatchOp(
+                            pdl.OperationType.get(), pdl_seq.bodyTarget, "is2DElementwise"
+                        )
+                        
+                        tiled = structured.TileUsingForOp(match.result, sizes=[4,16])
+                        with InsertionPoint(transform.ApplyPatternsOp(tiled.results[1]).patterns):
+                            structured.apply_patterns_linalg_tiling_canonicalization()
+
+                        padded = structured.PadOp(tiled.results[0],
+                                                copy_back_op="none",
+                                                pad_to_multiple_of=[1,1],
+                                                padding_values=[StringAttr.get("0x0"), StringAttr.get("0x0"), StringAttr.get("0x0")],
+                                                padding_dimensions = Attribute.parse("[0, 1]"))
+
+                        transform.YieldOp([])
+
+
+                transform.YieldOp([sequence.bodyTarget])
+
+        def main_type1(include, name):
+            sequence = transform.NamedSequenceOp(
+                "main_type1_" + name,
+                [transform.AnyOpType.get()],
+                [],
+                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
+            )
+
+            with InsertionPoint(sequence.body):
+                ## get all funcs
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    sequence.bodyTarget,
+                    ["func.func"]
+                )
+                ## get parent op
+                p = transform.get_parent_op(
+                    transform.AnyOpType.get(),
+                    funcs.result, 
+                    deduplicate=True,
+                )
+                ## include
+                sme = transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    include,
+                    transform.FailurePropagationMode.Propagate,
+                    [p],
+                )
+                
+                ## cse
+                cse = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    sme.result,
+                    "cse",
+                )
+
+                with InsertionPoint(transform.ApplyPatternsOp(cse).patterns):
+                    structured.apply_patterns_linalg_tiling_canonicalization()
+                    loop.apply_patterns_scf_for_loop_canonicalization()
+                
+                ## match looplike
+                looplike = structured.MatchOp.__base__(
+                    transform.AnyOpType.get(),
+                    cse.result,
+                    interface=structured.MatchInterfaceEnum.LoopLikeInterface
+                )
+                ## apply licm
+                transform.apply_licm(
+                    looplike.result,
+                )
+                ## match func from cse
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    cse.result,
+                    ["func.func"]
+                )
+                ## hoist redudant vector transfers
+                a = transform.structured.HoistRedundantVectorTransfersOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                )
+
+                ## MISSING: hoist redundant vector casts
+
+                ## hoist redundant vector broadcasts
+                b = transform.structured.HoistRedundantVectorBroadcastsOp(
+                    transform.AnyOpType.get(),
+                    a.result,
+                )
+                ## canonicalize
+                transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    b.result,
+                    "canonicalize",
+                )
+
+                transform.YieldOp([])
+  
+        def main_type2(include, name):
+            sequence = transform.NamedSequenceOp(
+                "main_type2_" + name,
+                [transform.AnyOpType.get()],
+                [],
+                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
+            )
+
+            with InsertionPoint(sequence.body):
+                ## get all funcs
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    sequence.bodyTarget,
+                    ["func.func"]
+                )
+                ## get parent op
+                p = transform.get_parent_op(
+                    transform.AnyOpType.get(),
+                    funcs.result, 
+                    deduplicate=True,
+                )
+                ## cse
+                cse = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    p,
+                    "cse",
+                )
+
+                can = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    cse.result,
+                    "canonicalize",
+                )
+
+                ## include
+                sme = transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    include, 
+                    transform.FailurePropagationMode.Propagate,
+                    [can],
+                )
+                
+                cse = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    sme.result,
+                    "cse",
+                )
+
+                with InsertionPoint(transform.ApplyPatternsOp(cse).patterns):
+                    structured.apply_patterns_linalg_tiling_canonicalization()
+                    loop.apply_patterns_scf_for_loop_canonicalization()
+                
+                ## match looplike
+                looplike = structured.MatchOp.__base__(
+                    transform.AnyOpType.get(),
+                    cse.result,
+                    interface=structured.MatchInterfaceEnum.LoopLikeInterface
+                )
+                ## apply licm
+                transform.apply_licm(
+                    looplike.result,
+                )
+                ## match func from cse
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    cse.result,
+                    ["func.func"]
+                )
+                ## hoist redudant vector transfers
+                a = transform.structured.HoistRedundantVectorTransfersOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                )
+
+                ## MISSING: hoist redundant vector casts
+
+                ## hoist redundant vector broadcasts
+                b = transform.structured.HoistRedundantVectorBroadcastsOp(
+                    transform.AnyOpType.get(),
+                    a.result,
+                )
+                ## canonicalize
+                transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    b.result,
+                    "canonicalize",
+                )
+
+                transform.YieldOp([])
+ 
+ 
+
+        def contraction_schedule():
+            sequence = transform.NamedSequenceOp(
+                "contraction_schedule",
+                [transform.AnyOpType.get()],
+                [transform.AnyOpType.get()],
+                arg_attrs=[{"transform.readonly": UnitAttr.get()}],
+            )
+
+            with InsertionPoint(sequence.body):
+                withPdl = transform_pdl.WithPDLPatternsOp(pdl.OperationType.get())
+                with InsertionPoint(withPdl.body):
+                    pattern = pdl.PatternOp(1, "isNDMatmulLike")
+                    with InsertionPoint(pattern.body):
+                        operands = pdl.OperandsOp()
+                        ty = pdl.TypesOp()
+                        newOp = pdl.OperationOp(name="linalg.generic", args=[operands], types=[ty])
+                        attr0 = pdl.AttributeOp(value=Attribute.parse('{ndim = 2 : i64, operand_number = 0 : i64}'))
+                        pdl.ApplyNativeConstraintOp([], "checkOperandNDim", args=[operands, attr0])
+                        attr1 = pdl.AttributeOp(value=Attribute.parse('{ndim = 2 : i64, operand_number = 1 : i64}'))
+                        pdl.ApplyNativeConstraintOp([], "checkOperandNDim", args=[operands, attr1])
+                        attr2 = pdl.AttributeOp(value=Attribute.parse('{ndim = 2 : i64, operand_number = 2 : i64}'))
+                        pdl.ApplyNativeConstraintOp([], "checkOperandNDim", args=[operands, attr2])
+                        pdl.ApplyNativeConstraintOp([], "isContractionLinalgOp", args=[newOp])
+                        pdl.RewriteOp(newOp, name="transform.dialect")
+
+                    pdl_seq = transform.SequenceOp(transform.FailurePropagationMode.Propagate, [], withPdl.bodyTarget)
+                    with InsertionPoint(pdl_seq.body):
+                        pdl_match = transform_pdl.PDLMatchOp(pdl.OperationType.get(), pdl_seq.bodyTarget, "isNDMatmulLike")
+
+                        matches = structured.MatchOp.match_op_names(
+                            pdl.OperationType.get(),
+                            pdl_seq.bodyTarget,
+                            ["linalg.matmul", "linalg.matmul_transpose_b", "linalg.matmul_transpose_a"]
+                        )
+
+                        merged = transform.MergeHandlesOp([pdl_match.result, matches.result])
+
+                        tiled1 = structured.TileUsingForOp(
+                            merged.result,
+                            sizes=[4096, 512, 512],
+                            interchange=Attribute.parse("[0, 2, 1]"),
+                        )
+
+                        tiled2 = structured.TileUsingForOp(
+                            tiled1.results[0],
+                            sizes=[16, 8, 1],
+                            interchange=Attribute.parse("[0, 1, 2]"),
+                        )
+
+                        with InsertionPoint(transform.ApplyPatternsOp(tiled2.results[1]).patterns):
+                            structured.apply_patterns_linalg_tiling_canonicalization()
+
+                        padded_tuple = structured.PadOp(
+                            tiled2.results[0],
+                            copy_back_op="none",
+                            pad_to_multiple_of=[1, 1, 1],
+                            pack_paddings=Attribute.parse("[1, 1, 0]"),
+                            padding_dimensions=Attribute.parse("[0, 1, 2]"),
+                            padding_values=[StringAttr.get("0x0"), StringAttr.get("0x0"), StringAttr.get("0x0")],
+                        )
+
+                        transform.AnnotateOp(padded_tuple.results[0], "padded_linalgacfd010b")
+
+                        parent = transform.GetParentOp(
+                            transform.AnyOpType.get(),
+                            tiled2.results[1], 
+                            isolated_from_above=True)
+
+                        with InsertionPoint(transform.ApplyPatternsOp(parent).patterns):
+                            loop.apply_patterns_scf_for_loop_canonicalization()
+
+                        loop_like = structured.MatchOp.__base__(
+                            transform.AnyOpType.get(),
+                            parent,
+                            interface=structured.MatchInterfaceEnum.LoopLikeInterface
+                        )
+
+                        transform.apply_licm(
+                            loop_like.result,
+                        )
+
+                        # match attributes {padded_linalgacfd010b} in parent
+                        matched_attrs = structured.MatchOp.__base__(
+                            transform.AnyOpType.get(),
+                            parent,
+                            op_attrs={"padded_linalgacfd010b": UnitAttr.get()},
+                        )
+
+                        producer0 = transform.GetProducerOfOperand(pdl.OperationType.get(), matched_attrs.results[0], 0)
+                        hoisted0 = structured.HoistPadOp(pdl.OperationType.get(), producer0, 3, transpose=[1, 0])
+                        producer1 = transform.GetProducerOfOperand(pdl.OperationType.get(), matched_attrs.results[0], 1)
+                        hoisted1 = structured.HoistPadOp(pdl.OperationType.get(), producer1, 3, transpose=[0, 1])
+                        transform.YieldOp([])
+
+                transform.YieldOp([sequence.bodyTarget])
+
+        def vectorize_schedule():
+            sequence = transform.NamedSequenceOp(
+                "vectorize_schedule",
+                [transform.AnyOpType.get()],
+                [transform.AnyOpType.get()],
+                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
+            )
+            with InsertionPoint(sequence.body):
+                vec = structured.VectorizeChildrenAndApplyPatternsOp(sequence.bodyTarget, vectorize_padding=True, vectorize_nd_extract=True) 
+                transform.YieldOp([vec])
+
+        def bufferize_schedule():
+            sequence = transform.NamedSequenceOp(
+                "bufferize_schedule",
+                [transform.AnyOpType.get()],
+                [transform.AnyOpType.get()],
+                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
+            )
+            with InsertionPoint(sequence.body):
+                matched = structured.MatchOp.match_op_names(
+                    sequence.bodyTarget,
+                    ["tensor.empty"]
+                )
+                
+                cast = transform.CastOp(transform.OperationType.get("tensor.empty"), matched.result)               
+                alloc = bufferization.EmptyTensorToAllocTensorOp(cast.result)
+                #MISSING: oneshot = bufferization.OneShotBufferizeOp(sequence.bodyTarget, bufferize_function_boundaries=True, memcpy_op="linalg.generic")
+                oneshot = bufferization.OneShotBufferizeOp(sequence.bodyTarget, bufferize_function_boundaries=True)
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    oneshot.result,
+                    ["func.func"]
+                )
+                transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                    "buffer-deallocation"
+                )
+
+                transform.YieldOp([oneshot])
+
+        def main_bufferize():
+            sequence = transform.NamedSequenceOp(
+                "main_bufferize",
+                [transform.AnyOpType.get()],
+                [],
+                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
+            )
+
+            with InsertionPoint(sequence.body):
+                ## get all funcs
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    sequence.bodyTarget,
+                    ["func.func"]
+                )
+                ## get parent op
+                p = transform.get_parent_op(
+                    transform.AnyOpType.get(),
+                    funcs.result, 
+                    deduplicate=True,
+                )
+                ## include
+                sme = transform.IncludeOp(
+                    [transform.AnyOpType.get()],
+                    "bufferize_schedule",
+                    transform.FailurePropagationMode.Propagate,
+                    [p],
+                )
+                
+                ## cse
+                cse = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    sme.result,
+                    "cse",
+                )
+
+                can = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    cse.result,
+                    "canonicalize",
+                )
+
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    can.result,
+                    ["func.func"]
+                )
+
+                a = transform.structured.HoistRedundantVectorTransfersOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                )
+
+                cse = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    a.result,
+                    "cse",
+                )
+
+                with InsertionPoint(transform.ApplyPatternsOp(cse).patterns):
+                    structured.apply_patterns_linalg_tiling_canonicalization()
+                    loop.apply_patterns_scf_for_loop_canonicalization()
+                
+                ## match looplike
+                looplike = structured.MatchOp.__base__(
+                    transform.AnyOpType.get(),
+                    cse.result,
+                    interface=structured.MatchInterfaceEnum.LoopLikeInterface
+                )
+                ## apply licm
+                transform.apply_licm(
+                    looplike.result,
+                )
+                ## match func from cse
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    cse.result,
+                    ["func.func"]
+                )
+                ## hoist redudant vector transfers
+                a = transform.structured.HoistRedundantVectorTransfersOp(
+                    transform.AnyOpType.get(),
+                    funcs.result,
+                )
+
+                ## MISSING: hoist redundant vector casts
+
+                ## hoist redundant vector broadcasts
+                b = transform.structured.HoistRedundantVectorBroadcastsOp(
+                    transform.AnyOpType.get(),
+                    a.result,
+                )
+                ## canonicalize
+                transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    b.result,
+                    "canonicalize",
+                )
+
+                transform.YieldOp([])
+ 
+
+        ## MISSING: legalize_schedule
+        
+        def pipeline_schedule():
+            sequence = transform.NamedSequenceOp(
+                "pipeline_schedule",
+                [transform.AnyOpType.get()],
+                [transform.AnyOpType.get()],
+                arg_attrs=[{"transform.consumed": UnitAttr.get()}],
+            )
+
+            with InsertionPoint(sequence.body):
+                withPdl1 = transform_pdl.WithPDLPatternsOp(pdl.OperationType.get())
+                with InsertionPoint(withPdl1.body):
+                    pattern = pdl.PatternOp(1, "isElementwiseMulLoop")
+                    with InsertionPoint(pattern.body):
+                        operands = pdl.OperandsOp()
+                        ty = pdl.TypesOp()
+                        loop_op = pdl.OperationOp(name="scf.for", args=[operands], types=[ty])
+                        pdl.ApplyNativeConstraintOp([], "isElementwiseMulLoop", args=[loop_op])
+                        pdl.RewriteOp(loop_op, name="transform.dialect")
+
+                    pdl_seq = transform.SequenceOp(transform.FailurePropagationMode.Propagate, [], withPdl1.bodyTarget)
+                    with InsertionPoint(pdl_seq.body):
+                        matched = transform_pdl.PDLMatchOp(pdl.OperationType.get(), pdl_seq.bodyTarget, "isElementwiseMulLoop")
+                        loop.LoopUnrollOp(matched.result, factor=8)
+                        transform.YieldOp([])
+
+                res0 = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), sequence.bodyTarget, "canonicalize")
+                res1 = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), res0, "cse")
+                res2 = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), res1, "canonicalize")
+
+                withPdl2 = transform_pdl.WithPDLPatternsOp(pdl.OperationType.get())
+                with InsertionPoint(withPdl2.body):
+                    pattern2 = pdl.PatternOp(1, "isElementwiseMulLoop")
+                    with InsertionPoint(pattern2.body):
+                        operands = pdl.OperandsOp()
+                        ty = pdl.TypesOp()
+                        loop_op = pdl.OperationOp(name="scf.for", args=[operands], types=[ty])
+                        pdl.ApplyNativeConstraintOp([], "isElementwiseMulLoop", args=[loop_op])
+                        pdl.RewriteOp(loop_op, name="transform.dialect")
+
+                    pdl_seq2 = transform.SequenceOp(transform.FailurePropagationMode.Propagate, [], withPdl2.bodyTarget)
+                    with InsertionPoint(pdl_seq2.body):
+                        matched2 = transform_pdl.PDLMatchOp(pdl.OperationType.get(), pdl_seq2.bodyTarget, "isElementwiseMulLoop")
+
+                        cast_for = transform.CastOp(transform.OperationType.get("scf.for"), matched2.result)
+
+                        loop.LoopPipelineOp(
+                            transform.OperationType.get("scf.for"),
+                            cast_for,
+                            iteration_interval=8,
+                            read_latency=1,
+                            #MISSING: scheduling_type="modulo-loops",
+                        )
+                        transform.YieldOp([])
+
+                withPdl3 = transform_pdl.WithPDLPatternsOp(pdl.OperationType.get())
+                with InsertionPoint(withPdl3.body):
+                    pattern3 = pdl.PatternOp(1, "isMicroKernel")
+                    with InsertionPoint(pattern3.body):
+                        operands = pdl.OperandsOp()
+                        ty = pdl.TypesOp()
+                        loop_op = pdl.OperationOp(name="scf.for", args=[operands], types=[ty])
+                        pdl.ApplyNativeConstraintOp([], "isMicroKernel", args=[loop_op])
+                        pdl.RewriteOp(loop_op, name="transform.dialect")
+
+                    pdl_seq3 = transform.SequenceOp(transform.FailurePropagationMode.Propagate, [], withPdl3.bodyTarget)
+                    with InsertionPoint(pdl_seq3.body):
+                        matched3 = transform_pdl.PDLMatchOp(pdl.OperationType.get(), pdl_seq3.bodyTarget, "isMicroKernel")
+                        loop.LoopUnrollOp(matched3.result, factor=18)
+                        transform.YieldOp([])
+
+                res3 = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), res2, "cse")
+                res4 = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), res3, "canonicalize")
+                res5 = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), res4, "cse")
+
+                withPdl4 = transform_pdl.WithPDLPatternsOp(pdl.OperationType.get())
+                with InsertionPoint(withPdl4.body):
+                    pattern4 = pdl.PatternOp(1, "isMicroKernel")
+                    with InsertionPoint(pattern4.body):
+                        operands = pdl.OperandsOp()
+                        ty = pdl.TypesOp()
+                        loop_op = pdl.OperationOp(name="scf.for", args=[operands], types=[ty])
+                        pdl.ApplyNativeConstraintOp([], "isMicroKernel", args=[loop_op])
+                        pdl.RewriteOp(loop_op, name="transform.dialect")
+
+                    pdl_seq4 = transform.SequenceOp(transform.FailurePropagationMode.Propagate, [], withPdl4.bodyTarget)
+                    with InsertionPoint(pdl_seq4.body):
+                        matched4 = transform_pdl.PDLMatchOp(pdl.OperationType.get(), pdl_seq4.bodyTarget, "isMicroKernel")
+                        split0, split1 = transform.SplitHandleOp([pdl.OperationType.get(), pdl.OperationType.get()], matched4.result).results  # yields two handles
+                        cast_micro_for = transform.CastOp(transform.OperationType.get("scf.for"), split0)
+                        loop.LoopPipelineOp(
+                            transform.OperationType.get("scf.for"),
+                            cast_micro_for,
+                            iteration_interval=18,
+                            read_latency=1,
+                        )
+                        transform.YieldOp([])
+
+                transform.YieldOp([res5])
+
+
+        def loops_schedule():
+            sequence = transform.NamedSequenceOp(
+                "loops_schedule",
+                [transform.AnyOpType.get()],
+                [transform.AnyOpType.get()],
+                arg_attrs=[{"transform.readonly": UnitAttr.get()}],
+            )
+
+            with InsertionPoint(sequence.body):
+                # match all func.func in the input
+                funcs = structured.MatchOp.match_op_names(
+                    sequence.bodyTarget,
+                    ["func.func"],
+                )
+
+                # 1) lower_contraction + transfer_permutation_patterns
+                with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
+                    vector.ApplyLowerContractionPatternsOp()
+                    vector.ApplyTransferPermutationPatternsOp()
+
+                # 2) add lower_multi_reduction
+                with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
+                    vector.ApplyLowerContractionPatternsOp()
+                    vector.ApplyTransferPermutationPatternsOp()
+                    vector.ApplyVectorReductionToContractPatternsOp()
+
+                # 3) add split_transfer_full_partial (strategy = "vector-transfer")
+                with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
+                    vector.ApplyLowerContractionPatternsOp()
+                    vector.ApplyTransferPermutationPatternsOp()
+                    vector.ApplyVectorReductionToContractPatternsOp()
+                    # pass the split_transfer_strategy as a string attr
+                    vector.ApplySplitTransferFullPartialPatternsOp(split_transfer_strategy=vector.VectorTransferSplit.VectorTransfer)
+
+                # 4) add lower_transfer
+                with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
+                    vector.ApplyLowerContractionPatternsOp()
+                    vector.ApplyTransferPermutationPatternsOp()
+                    vector.ApplyVectorReductionToContractPatternsOp()
+                    vector.ApplySplitTransferFullPartialPatternsOp(split_transfer_strategy=vector.VectorTransferSplit.VectorTransfer)
+                    vector.ApplyLowerTransferPatternsOp()
+
+                # 5) add transfer_to_scf full_unroll = true
+                with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
+                    vector.ApplyLowerContractionPatternsOp()
+                    vector.ApplyTransferPermutationPatternsOp()
+                    vector.ApplyVectorReductionToContractPatternsOp()
+                    vector.ApplySplitTransferFullPartialPatternsOp(split_transfer_strategy=vector.VectorTransferSplit.VectorTransfer)
+                    vector.ApplyLowerTransferPatternsOp()
+                    # full_unroll is a boolean attribute
+                    vector.ApplyTransferToScfPatternsOp(full_unroll=True)
+
+                # 6) add lower_shape_cast
+                with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
+                    vector.ApplyLowerContractionPatternsOp()
+                    vector.ApplyTransferPermutationPatternsOp()
+                    vector.ApplyVectorReductionToContractPatternsOp()
+                    vector.ApplySplitTransferFullPartialPatternsOp(split_transfer_strategy=vector.VectorTransferSplit.VectorTransfer)
+                    vector.ApplyLowerTransferPatternsOp()
+                    vector.ApplyTransferToScfPatternsOp(full_unroll=True)
+                    vector.ApplyLowerShapeCastPatternsOp()
+
+                # 7) add lower_transpose
+                with InsertionPoint(transform.ApplyPatternsOp(funcs.result).patterns):
+                    vector.ApplyLowerContractionPatternsOp()
+                    vector.ApplyTransferPermutationPatternsOp()
+                    vector.ApplyVectorReductionToContractPatternsOp()
+                    vector.ApplySplitTransferFullPartialPatternsOp(split_transfer_strategy=vector.VectorTransferSplit.VectorTransfer)
+                    vector.ApplyLowerTransferPatternsOp()
+                    vector.ApplyTransferToScfPatternsOp(full_unroll=True)
+                    vector.ApplyLowerShapeCastPatternsOp()
+                    vector.ApplyLowerTransposePatternsOp()
+
+                # match again (equivalent to %1 in MLIR) and run registered pass
+                funcs2 = structured.MatchOp.match_op_names(
+                    sequence.bodyTarget,
+                    ["func.func"],
+                )
+                res_pass = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), funcs2.result, "scf-for-to-while")
+
+                # yield the original input handle (same as `transform.yield %arg0`)
+                transform.YieldOp([sequence.bodyTarget])
+
+
+        def lower_to_llvm_schedule():
+            sequence = transform.NamedSequenceOp(
+                "lower_to_llvm_schedule",
+                [transform.AnyOpType.get()],
+                [transform.AnyOpType.get()],
+                arg_attrs=[{"transform.readonly": UnitAttr.get()}],
+            )
+
+            with InsertionPoint(sequence.body):
+                result = transform.lower_to_llvm_new(
+                    sequence.bodyTarget,
+                    enable_arm_sve=True,
+                    enable_index_optimizations=True,
+                    vscale_range=2,
+                )
+                transform.YieldOp([sequence.bodyTarget])
+ 
+
+           
+
         ## Transform needed for SVE (as seen in the official MLIR example)
         def tileAndVectorize():
             sequence = transform.NamedSequenceOp(
@@ -293,40 +965,41 @@ class CPUBackend(BaseBackend):
                 
             with InsertionPoint(sequence.body):
                     
-                buff = bufferization.OneShotBufferizeOp(sequence.bodyTarget, bufferize_function_boundaries= True)
-
-                # get all the functions
-                funcs = structured.MatchOp.match_op_names(
-                    transform.OperationType.get("func.func"),
-                    buff.result,
-                    ["func.func"]
-                )
-
-                ## for each
-                foreach = transform.ForeachOp(
+                include = transform.IncludeOp(
                     [],
-                    funcs,
+                    FlatSymbolRefAttr.get("main_type1_pad"),
+                    transform.FailurePropagationMode.Propagate,
+                    [sequence.bodyTarget],
                 )
-                    
-                foreachBody = foreach.body.blocks.append(transform.OperationType.get("func.func"))
-                    
-                with InsertionPoint(foreachBody):
-                    # tile and vectorize
-                    x = transform.IncludeOp(
-                        [],
-                        FlatSymbolRefAttr.get("__tile_and_vectorize"),
-                        transform.FailurePropagationMode.Propagate,
-                        [foreachBody.arguments[0]],
-                    )
-                    # optimize
-                    transform.IncludeOp(
-                        [],
-                        FlatSymbolRefAttr.get("opt"),
-                        transform.FailurePropagationMode.Propagate,
-                        [foreachBody.arguments[0]],
-                    )
 
-                    transform.YieldOp([])
+                include2 = transform.IncludeOp(
+                    [],
+                    FlatSymbolRefAttr.get("main_type1_contraction"),
+                    transform.FailurePropagationMode.Propagate,
+                    [sequence.bodyTarget],
+                )
+
+                include3 = transform.IncludeOp(
+                    [],
+                    FlatSymbolRefAttr.get("main_type1_vectorize"),
+                    transform.FailurePropagationMode.Propagate,
+                    [sequence.bodyTarget],
+                )
+
+                include4 = transform.IncludeOp(
+                    [],
+                    FlatSymbolRefAttr.get("main_bufferize"),
+                    transform.FailurePropagationMode.Propagate,
+                    [sequence.bodyTarget],
+                )
+
+                include5 = transform.IncludeOp(
+                    [],
+                    FlatSymbolRefAttr.get("main_type1_pipeline"),
+                    transform.FailurePropagationMode.Propagate,
+                    [sequence.bodyTarget],
+                )
+
 
                 transform.YieldOp([])
                      
@@ -336,8 +1009,20 @@ class CPUBackend(BaseBackend):
             mod.operation.attributes["transform.with_named_sequence"] = UnitAttr.get()
             
             with InsertionPoint(mod.body):
-                tileAndVectorize()
-                opt()
+                ew_2d_tile_pad_schedule()
+                main_type1("ew_2d_tile_pad_schedule", "pad")
+                contraction_schedule()
+                main_type1("contraction_schedule", "contraction")
+                vectorize_schedule()
+                main_type1("vectorize_schedule", "vectorize")
+                bufferize_schedule()
+                main_bufferize()
+                pipeline_schedule()
+                main_type1("pipeline_schedule", "pipeline")
+                loops_schedule()
+                main_type2("loops_schedule", "loops")
+                lower_to_llvm_schedule()
+                main_type2("lower_to_llvm_schedule", "lower_to_llvm")
                 transform_main()
 
             ## Append our transform to the original source
@@ -639,41 +1324,29 @@ class CPUBackend(BaseBackend):
     def _ttsharedir_to_llir(self, ttsharedir: str):
         with tempfile.TemporaryDirectory() as tmpdir:
             ttshared_path = os.path.join(tmpdir, "ttshared.mlir")
+            transformed_path = os.path.join(tmpdir, "transformed.mlir") ## ttshared after applying the transform dialect
             llmlir_path = os.path.join(tmpdir, "ll.mlir")
             llir_path = os.path.join(tmpdir, "ll.ir")
             Path(ttshared_path).write_text(ttsharedir)
+            mlir_opt_path = _get_llvm_bin_path("mlir-opt")
             _dump_ir_if_needed([ttshared_path])
             context = ir.context()
             triton_shared.ir.load_dialects(context)
-            mod = ir.parse_mlir_module(ttshared_path, context)
 
-            pm = ir.pass_manager(context)
             #pm.enable_debug()
             
             if FORCE_SME or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
-                triton_shared.to_llir.add_transform_interpreter(pm)
+                pipeline = [
+                "--transform-interpreter",
+                "--test-transform-dialect-erase-schedule",
+                ]
             elif FORCE_SVE or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
-                triton_shared.to_llir.add_transform_interpreter(pm)
-                triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm)
-                triton_shared.to_llir.add_convert_vector_to_llvm_with_sve(pm)
-                ## lowering to LLVM
-                triton_shared.to_llir.add_convert_vector_to_scf(pm)
-                triton_shared.to_llir.add_convert_linalg_to_loops(pm)
-                triton_shared.to_llir.add_lower_affine(pm)
-                triton_shared.to_llir.add_convert_scf_to_cf(pm)
-                triton_shared.to_llir.add_canonicalizer(pm)
-                triton_shared.to_llir.add_cse(pm)
-                triton_shared.to_llir.add_convert_math_to_llvm(pm)
-                triton_shared.to_llir.add_expand_strided_metadata(pm)
-                triton_shared.to_llir.add_lower_affine(pm)
-                triton_shared.to_llir.add_convert_tptr_to_llvm(pm)
-                triton_shared.to_llir.add_convert_to_llvm(pm)
-                triton_shared.to_llir.add_finalize_memref_to_llvm(pm)
-                triton_shared.to_llir.add_convert_func_to_llvm(pm)
-                triton_shared.to_llir.add_convert_index_to_llvm(pm)
-                triton_shared.to_llir.add_reconcile_unrealized_casts(pm)
-                triton_shared.to_llir.add_strip_debug_info(pm)
+                pipeline = [
+                "--transform-interpreter",
+                "--test-transform-dialect-erase-schedule",
+                ]
             else:
+                # TODO: Update this to use the transform dialect passes or else it wont work 
                 pipeline = [
                 "--convert-linalg-to-affine-loops",
                 "--empty-tensor-to-alloc-tensor",
@@ -686,6 +1359,11 @@ class CPUBackend(BaseBackend):
                 "--reconcile-unrealized-casts",
                 ]
            
+            subprocess.check_call([mlir_opt_path, ttshared_path] + pipeline + [ "-o", transformed_path])
+
+            mod = ir.parse_mlir_module(transformed_path, context)
+            pm = ir.pass_manager(context)
+            triton_shared.to_llir.add_convert_tptr_to_llvm(pm)
             pm.run(mod)
             Path(llmlir_path).write_text(str(mod))
            
