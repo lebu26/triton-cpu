@@ -187,7 +187,7 @@ class CPUBackend(BaseBackend):
                     with InsertionPoint(pattern.body):
                         operands = pdl.OperandsOp()
                         ty = pdl.TypesOp()
-                        newOp = pdl.OperationOp(name="linalg.generic", args=[operands], types=[ty]) 
+                        newOp = pdl.OperationOp(name="linalg.matmul", args=[operands], types=[ty]) 
                         attr = pdl.AttributeOp(value=Attribute.parse('{ndim = 2 : i64, operand_number = 1 : i64}'))
                         pdl.ApplyNativeConstraintOp([], "checkOperandNDim", args=[operands, attr])
                         pdl.ApplyNativeConstraintOp([], "isElementwiseLinalgOp", args=[newOp])
@@ -413,7 +413,7 @@ class CPUBackend(BaseBackend):
                     with InsertionPoint(pattern.body):
                         operands = pdl.OperandsOp()
                         ty = pdl.TypesOp()
-                        newOp = pdl.OperationOp(name="linalg.generic", args=[operands], types=[ty])
+                        newOp = pdl.OperationOp(name="linalg.matmul", args=[operands], types=[ty])
                         attr0 = pdl.AttributeOp(value=Attribute.parse('{ndim = 2 : i64, operand_number = 0 : i64}'))
                         pdl.ApplyNativeConstraintOp([], "checkOperandNDim", args=[operands, attr0])
                         attr1 = pdl.AttributeOp(value=Attribute.parse('{ndim = 2 : i64, operand_number = 1 : i64}'))
@@ -427,68 +427,41 @@ class CPUBackend(BaseBackend):
                     with InsertionPoint(pdl_seq.body):
                         pdl_match = transform_pdl.PDLMatchOp(pdl.OperationType.get(), pdl_seq.bodyTarget, "isNDMatmulLike")
 
-                        matches = structured.MatchOp.match_op_names(
-                            pdl.OperationType.get(),
-                            pdl_seq.bodyTarget,
-                            ["linalg.matmul", "linalg.matmul_transpose_b", "linalg.matmul_transpose_a"]
-                        )
-
-                        merged = transform.MergeHandlesOp([pdl_match.result, matches.result])
-
                         tiled1 = structured.TileUsingForOp(
-                            merged.result,
-                            sizes=[4096, 512, 512],
+                            pdl_match.result,
+                            sizes=[2048, 256, 256],
                             interchange=Attribute.parse("[0, 2, 1]"),
                         )
 
                         tiled2 = structured.TileUsingForOp(
                             tiled1.results[0],
-                            sizes=[16, 8, 1],
+                            sizes=[8, 8, 1],
                             interchange=Attribute.parse("[0, 1, 2]"),
                         )
-
-                        with InsertionPoint(transform.ApplyPatternsOp(tiled2.results[1]).patterns):
-                            structured.apply_patterns_linalg_tiling_canonicalization()
 
                         padded_tuple = structured.PadOp(
                             tiled2.results[0],
                             copy_back_op="none",
                             pad_to_multiple_of=[1, 1, 1],
-                            pack_paddings=Attribute.parse("[1, 1, 0]"),
+                            pack_paddings = Attribute.parse("[0, 1, 1, 0]"),
                             padding_dimensions=Attribute.parse("[0, 1, 2]"),
-                            padding_values=[StringAttr.get("0x0"), StringAttr.get("0x0"), StringAttr.get("0x0")],
+                            padding_values=[StringAttr.get("0x0"), StringAttr.get("0x0"), StringAttr.get("0x0"), StringAttr.get("0x0")],
                         )
 
-                        transform.AnnotateOp(padded_tuple.results[0], "padded_linalgacfd010b")
+                        producer0 = transform.GetProducerOfOperand(pdl.OperationType.get(), padded_tuple.results[0], 1)
+                        producer1 = transform.GetProducerOfOperand(pdl.OperationType.get(), padded_tuple.results[0], 2)
 
-                        parent = transform.GetParentOp(
-                            transform.AnyOpType.get(),
-                            tiled2.results[1], 
-                            isolated_from_above=True)
-
-                        with InsertionPoint(transform.ApplyPatternsOp(parent).patterns):
-                            loop.apply_patterns_scf_for_loop_canonicalization()
-
-                        loop_like = structured.MatchOp.__base__(
-                            transform.AnyOpType.get(),
-                            parent,
-                            interface=structured.MatchInterfaceEnum.LoopLikeInterface
+                        fors = structured.MatchOp.match_op_names(
+                            pdl.OperationType.get(),
+                            pdl_seq.bodyTarget,
+                            ["scf.for"]
                         )
 
                         transform.apply_licm(
-                            loop_like.result,
+                            fors.result,
                         )
 
-                        # match attributes {padded_linalgacfd010b} in parent
-                        matched_attrs = structured.MatchOp.__base__(
-                            transform.AnyOpType.get(),
-                            parent,
-                            op_attrs={"padded_linalgacfd010b": UnitAttr.get()},
-                        )
-
-                        producer0 = transform.GetProducerOfOperand(pdl.OperationType.get(), matched_attrs.results[0], 0)
-                        hoisted0 = structured.HoistPadOp(pdl.OperationType.get(), producer0, 3, transpose=[1, 0])
-                        producer1 = transform.GetProducerOfOperand(pdl.OperationType.get(), matched_attrs.results[0], 1)
+                        hoisted0 = structured.HoistPadOp(pdl.OperationType.get(), producer0, 4, transpose=[1, 0])
                         hoisted1 = structured.HoistPadOp(pdl.OperationType.get(), producer1, 3, transpose=[0, 1])
                         transform.YieldOp([])
 
@@ -960,7 +933,7 @@ class CPUBackend(BaseBackend):
                 "__transform_main",
                 [transform.AnyOpType.get()],
                 [],
-                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
+                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
             )
                 
             with InsertionPoint(sequence.body):
@@ -999,7 +972,20 @@ class CPUBackend(BaseBackend):
                     transform.FailurePropagationMode.Propagate,
                     [sequence.bodyTarget],
                 )
-
+                
+                include6 = transform.IncludeOp(
+                    [],
+                    FlatSymbolRefAttr.get("main_type2_loops"),
+                    transform.FailurePropagationMode.Propagate,
+                    [sequence.bodyTarget],
+                )
+                
+                include7 = transform.IncludeOp(
+                    [],
+                    FlatSymbolRefAttr.get("main_type2_lower_to_llvm"),
+                    transform.FailurePropagationMode.Propagate,
+                    [sequence.bodyTarget],
+                )
 
                 transform.YieldOp([])
                      
