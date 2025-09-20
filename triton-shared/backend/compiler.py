@@ -147,86 +147,19 @@ class CPUBackend(BaseBackend):
             _dump_ir_if_needed([src_path])
             triton_shared_opt_path = _get_triton_shared_opt_path()
             try:
-                subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental","-o", dst_path])
+                subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "-o", dst_path])
                 return Path(dst_path).read_text()
             except subprocess.CalledProcessError as e:
                 if ENABLE_FALLBACK:
                     print("TritonShared-MLIR optimization failed, falling back to CPU backend")
                     os.environ["TRITON_USE_SHARED_BACKEND"] = "0"
                     raise CPUFallbackException
-            '''
-            context = ir.context()
-            triton_shared.ir.load_dialects(context)
-            triton_shared.debug.print_context_ops(context)
-            pm = ir.pass_manager(context)
-
-            triton_shared.to_ttsharedir.add_triton_to_linalg_experimental(pm)
-            pm.run(mod)
-            
-            Path(dst_path).write_text(str(mod))
-            '''
-            
             
             return Path(dst_path).read_text()
 
 
 
     def _sve_transform(self, src: str) -> str:
-
-        def ew_2d_tile_pad_schedule():
-            sequence = transform.NamedSequenceOp(
-                "ew_2d_tile_pad_schedule",
-                [transform.AnyOpType.get()],
-                [transform.AnyOpType.get()],
-                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
-            )
-            with InsertionPoint(sequence.body):
-                withPdl = transform_pdl.WithPDLPatternsOp(pdl.OperationType.get())
-                with InsertionPoint(withPdl.body):
-                    pattern = pdl.PatternOp(1, "is2DElementwise")
-                    with InsertionPoint(pattern.body):
-                        operands = pdl.OperandsOp()
-                        ty = pdl.TypesOp()
-                        newOp = pdl.OperationOp(name="linalg.matmul", args=[operands], types=[ty]) 
-                        attr = pdl.AttributeOp(value=Attribute.parse('{ndim = 2 : i64, operand_number = 1 : i64}'))
-                        pdl.ApplyNativeConstraintOp([], "checkOperandNDim", args=[operands, attr])
-                        pdl.ApplyNativeConstraintOp([], "isElementwiseLinalgOp", args=[newOp])
-                        pdl.RewriteOp(newOp, name="transform.dialect")
-
-                    pdl_seq = transform.SequenceOp(transform.FailurePropagationMode.Propagate, [], withPdl.bodyTarget)
-                    with InsertionPoint(pdl_seq.body):
-                        matched = structured.MatchOp.match_op_names(
-                            pdl.OperationType.get(),
-                            pdl_seq.bodyTarget,
-                            ["linalg.mul"]
-                        )
-                        generalize = structured.GeneralizeOp(matched.result)
-                        funcs = structured.MatchOp.match_op_names(
-                            pdl.OperationType.get(),
-                            pdl_seq.bodyTarget,
-                            ["func.func"]
-                        )
-                        with InsertionPoint(transform.ApplyPatternsOp(funcs).patterns):
-                            structured.apply_patterns_linalg_erase_unnecessary_inputs()
-
-                        match = transform_pdl.PDLMatchOp(
-                            pdl.OperationType.get(), pdl_seq.bodyTarget, "is2DElementwise"
-                        )
-                        
-                        tiled = structured.TileUsingForOp(match.result, sizes=[4,16])
-                        with InsertionPoint(transform.ApplyPatternsOp(tiled.results[1]).patterns):
-                            structured.apply_patterns_linalg_tiling_canonicalization()
-
-                        padded = structured.PadOp(tiled.results[0],
-                                                copy_back_op="none",
-                                                pad_to_multiple_of=[1,1],
-                                                padding_values=[StringAttr.get("0x0"), StringAttr.get("0x0"), StringAttr.get("0x0")],
-                                                padding_dimensions = Attribute.parse("[0, 1]"))
-
-                        transform.YieldOp([])
-
-
-                transform.YieldOp([sequence.bodyTarget])
 
         def main_type1(include, name):
             sequence = transform.NamedSequenceOp(
@@ -407,63 +340,76 @@ class CPUBackend(BaseBackend):
             )
 
             with InsertionPoint(sequence.body):
-                withPdl = transform_pdl.WithPDLPatternsOp(pdl.OperationType.get())
-                with InsertionPoint(withPdl.body):
-                    pattern = pdl.PatternOp(1, "isNDMatmulLike")
-                    with InsertionPoint(pattern.body):
-                        operands = pdl.OperandsOp()
-                        ty = pdl.TypesOp()
-                        newOp = pdl.OperationOp(name="linalg.matmul", args=[operands], types=[ty])
-                        attr0 = pdl.AttributeOp(value=Attribute.parse('{ndim = 2 : i64, operand_number = 0 : i64}'))
-                        pdl.ApplyNativeConstraintOp([], "checkOperandNDim", args=[operands, attr0])
-                        attr1 = pdl.AttributeOp(value=Attribute.parse('{ndim = 2 : i64, operand_number = 1 : i64}'))
-                        pdl.ApplyNativeConstraintOp([], "checkOperandNDim", args=[operands, attr1])
-                        attr2 = pdl.AttributeOp(value=Attribute.parse('{ndim = 2 : i64, operand_number = 2 : i64}'))
-                        pdl.ApplyNativeConstraintOp([], "checkOperandNDim", args=[operands, attr2])
-                        pdl.ApplyNativeConstraintOp([], "isContractionLinalgOp", args=[newOp])
-                        pdl.RewriteOp(newOp, name="transform.dialect")
+                
+                matmuls = structured.MatchOp.match_op_names(
+                    sequence.bodyTarget,
+                    ["linalg.matmul"]
+                )
+                
+                tiled1 = structured.TileUsingForOp(
+                    matmuls.result,
+                    sizes=[2048, 256, 256],
+                    interchange=Attribute.parse("[0, 2, 1]"),
+                )
 
-                    pdl_seq = transform.SequenceOp(transform.FailurePropagationMode.Propagate, [], withPdl.bodyTarget)
-                    with InsertionPoint(pdl_seq.body):
-                        pdl_match = transform_pdl.PDLMatchOp(pdl.OperationType.get(), pdl_seq.bodyTarget, "isNDMatmulLike")
+                tiled2 = structured.TileUsingForOp(
+                    tiled1.results[0],
+                    sizes=[8, 8, 1],
+                    interchange=Attribute.parse("[0, 1, 2]"),
+                )
 
-                        tiled1 = structured.TileUsingForOp(
-                            pdl_match.result,
-                            sizes=[2048, 256, 256],
-                            interchange=Attribute.parse("[0, 2, 1]"),
-                        )
+                padded_tuple = structured.PadOp(
+                    tiled2.results[0],
+                    copy_back_op="none",
+                    pad_to_multiple_of=[1, 1, 1],
+                    pack_paddings = Attribute.parse("[0, 1, 1, 0]"),
+                    padding_dimensions=Attribute.parse("[0, 1, 2]"),
+                    padding_values=[StringAttr.get("0x0"), StringAttr.get("0x0"), StringAttr.get("0x0"), StringAttr.get("0x0")],
+                )
 
-                        tiled2 = structured.TileUsingForOp(
-                            tiled1.results[0],
-                            sizes=[8, 8, 1],
-                            interchange=Attribute.parse("[0, 1, 2]"),
-                        )
+                fors = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    sequence.bodyTarget,
+                    ["scf.for"]
+                )
 
-                        padded_tuple = structured.PadOp(
-                            tiled2.results[0],
-                            copy_back_op="none",
-                            pad_to_multiple_of=[1, 1, 1],
-                            pack_paddings = Attribute.parse("[0, 1, 1, 0]"),
-                            padding_dimensions=Attribute.parse("[0, 1, 2]"),
-                            padding_values=[StringAttr.get("0x0"), StringAttr.get("0x0"), StringAttr.get("0x0"), StringAttr.get("0x0")],
-                        )
+                transform.apply_licm(
+                    fors.result,
+                )
 
-                        producer0 = transform.GetProducerOfOperand(pdl.OperationType.get(), padded_tuple.results[0], 1)
-                        producer1 = transform.GetProducerOfOperand(pdl.OperationType.get(), padded_tuple.results[0], 2)
+                funcs = structured.MatchOp.match_op_names(
+                    transform.AnyOpType.get(),
+                    sequence.bodyTarget,
+                    ["func.func"]
+                )
 
-                        fors = structured.MatchOp.match_op_names(
-                            pdl.OperationType.get(),
-                            pdl_seq.bodyTarget,
-                            ["scf.for"]
-                        )
+                alt = transform.AlternativesOp(
+                    [],  # results_
+                    2,                            # number of alternatives
+                    scope=funcs                   # %funcs
+                )
 
-                        transform.apply_licm(
-                            fors.result,
-                        )
+                block0 = alt.regions[0].blocks.append(transform.AnyOpType.get())
+                f = block0.arguments[0]
+                with InsertionPoint(block0):
+                    mm = structured.MatchOp.match_op_names(
+                        f,
+                        ["linalg.matmul"] 
+                    )
+                    producer0 = transform.GetProducerOfOperand(transform.AnyOpType.get(), mm.results, 1)
+                    producer1 = transform.GetProducerOfOperand(transform.AnyOpType.get(), mm.results, 2)
+                    hoisted0 = structured.HoistPadOp(transform.AnyOpType.get(), producer0, 4, transpose=[1, 0])
+                    hoisted1 = structured.HoistPadOp(transform.AnyOpType.get(), producer1, 3, transpose=[0, 1])
+                    transform.YieldOp([])
 
-                        hoisted0 = structured.HoistPadOp(pdl.OperationType.get(), producer0, 4, transpose=[1, 0])
-                        hoisted1 = structured.HoistPadOp(pdl.OperationType.get(), producer1, 3, transpose=[0, 1])
-                        transform.YieldOp([])
+                block1 = alt.regions[1].blocks.append(transform.AnyOpType.get())
+                f = block1.arguments[0]
+                with InsertionPoint(block1):
+                    mm = structured.MatchOp.match_op_names(
+                        f,
+                        ["linalg.matmul"] 
+                    )
+                    transform.YieldOp([])
 
                 transform.YieldOp([sequence.bodyTarget])
 
@@ -493,8 +439,7 @@ class CPUBackend(BaseBackend):
                 
                 cast = transform.CastOp(transform.OperationType.get("tensor.empty"), matched.result)               
                 alloc = bufferization.EmptyTensorToAllocTensorOp(cast.result)
-                #MISSING: oneshot = bufferization.OneShotBufferizeOp(sequence.bodyTarget, bufferize_function_boundaries=True, memcpy_op="linalg.generic")
-                oneshot = bufferization.OneShotBufferizeOp(sequence.bodyTarget, bufferize_function_boundaries=True)
+                oneshot = bufferization.OneShotBufferizeOp(sequence.bodyTarget, bufferize_function_boundaries=True, memcpy_op="linalg.copy")
                 funcs = structured.MatchOp.match_op_names(
                     transform.AnyOpType.get(),
                     oneshot.result,
@@ -611,6 +556,22 @@ class CPUBackend(BaseBackend):
  
 
         ## MISSING: legalize_schedule
+
+        def legalize_schedule():
+            sequence = transform.NamedSequenceOp(
+                "legalize_schedule",
+                [transform.AnyOpType.get()],
+                [transform.AnyOpType.get()],
+                arg_attrs=[{"transform.readonly": UnitAttr.get()}],
+            )
+
+            with InsertionPoint(sequence.body):
+                result = transform.legalize(
+                    vscale=2,
+                )
+                transform.YieldOp([sequence.bodyTarget])
+ 
+           
         
         def pipeline_schedule():
             sequence = transform.NamedSequenceOp(
@@ -621,51 +582,6 @@ class CPUBackend(BaseBackend):
             )
 
             with InsertionPoint(sequence.body):
-                withPdl1 = transform_pdl.WithPDLPatternsOp(pdl.OperationType.get())
-                with InsertionPoint(withPdl1.body):
-                    pattern = pdl.PatternOp(1, "isElementwiseMulLoop")
-                    with InsertionPoint(pattern.body):
-                        operands = pdl.OperandsOp()
-                        ty = pdl.TypesOp()
-                        loop_op = pdl.OperationOp(name="scf.for", args=[operands], types=[ty])
-                        pdl.ApplyNativeConstraintOp([], "isElementwiseMulLoop", args=[loop_op])
-                        pdl.RewriteOp(loop_op, name="transform.dialect")
-
-                    pdl_seq = transform.SequenceOp(transform.FailurePropagationMode.Propagate, [], withPdl1.bodyTarget)
-                    with InsertionPoint(pdl_seq.body):
-                        matched = transform_pdl.PDLMatchOp(pdl.OperationType.get(), pdl_seq.bodyTarget, "isElementwiseMulLoop")
-                        loop.LoopUnrollOp(matched.result, factor=8)
-                        transform.YieldOp([])
-
-                res0 = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), sequence.bodyTarget, "canonicalize")
-                res1 = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), res0, "cse")
-                res2 = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), res1, "canonicalize")
-
-                withPdl2 = transform_pdl.WithPDLPatternsOp(pdl.OperationType.get())
-                with InsertionPoint(withPdl2.body):
-                    pattern2 = pdl.PatternOp(1, "isElementwiseMulLoop")
-                    with InsertionPoint(pattern2.body):
-                        operands = pdl.OperandsOp()
-                        ty = pdl.TypesOp()
-                        loop_op = pdl.OperationOp(name="scf.for", args=[operands], types=[ty])
-                        pdl.ApplyNativeConstraintOp([], "isElementwiseMulLoop", args=[loop_op])
-                        pdl.RewriteOp(loop_op, name="transform.dialect")
-
-                    pdl_seq2 = transform.SequenceOp(transform.FailurePropagationMode.Propagate, [], withPdl2.bodyTarget)
-                    with InsertionPoint(pdl_seq2.body):
-                        matched2 = transform_pdl.PDLMatchOp(pdl.OperationType.get(), pdl_seq2.bodyTarget, "isElementwiseMulLoop")
-
-                        cast_for = transform.CastOp(transform.OperationType.get("scf.for"), matched2.result)
-
-                        loop.LoopPipelineOp(
-                            transform.OperationType.get("scf.for"),
-                            cast_for,
-                            iteration_interval=8,
-                            read_latency=1,
-                            #MISSING: scheduling_type="modulo-loops",
-                        )
-                        transform.YieldOp([])
-
                 withPdl3 = transform_pdl.WithPDLPatternsOp(pdl.OperationType.get())
                 with InsertionPoint(withPdl3.body):
                     pattern3 = pdl.PatternOp(1, "isMicroKernel")
@@ -682,7 +598,7 @@ class CPUBackend(BaseBackend):
                         loop.LoopUnrollOp(matched3.result, factor=18)
                         transform.YieldOp([])
 
-                res3 = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), res2, "cse")
+                res3 = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), sequence.bodyTarget, "cse")
                 res4 = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), res3, "canonicalize")
                 res5 = transform.ApplyRegisteredPassOp(transform.AnyOpType.get(), res4, "cse")
 
@@ -699,8 +615,8 @@ class CPUBackend(BaseBackend):
                     pdl_seq4 = transform.SequenceOp(transform.FailurePropagationMode.Propagate, [], withPdl4.bodyTarget)
                     with InsertionPoint(pdl_seq4.body):
                         matched4 = transform_pdl.PDLMatchOp(pdl.OperationType.get(), pdl_seq4.bodyTarget, "isMicroKernel")
-                        split0, split1 = transform.SplitHandleOp([pdl.OperationType.get(), pdl.OperationType.get()], matched4.result).results  # yields two handles
-                        cast_micro_for = transform.CastOp(transform.OperationType.get("scf.for"), split0)
+                        #split0, split1 = transform.SplitHandleOp([pdl.OperationType.get(), pdl.OperationType.get()], matched4.result).results  # yields two handles
+                        cast_micro_for = transform.CastOp(transform.OperationType.get("scf.for"), matched4)
                         loop.LoopPipelineOp(
                             transform.OperationType.get("scf.for"),
                             cast_micro_for,
@@ -861,35 +777,10 @@ class CPUBackend(BaseBackend):
 
             with InsertionPoint(sequence.body):
 
-                transform.apply_cse(
-                    sequence.bodyTarget,)
-
-                c = transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    sequence.bodyTarget,
-                    "canonicalize",)
-
-                dealloc = transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    c.result,
-                    "buffer-deallocation-pipeline",
-                )
-                    
-                s = transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    dealloc.result,
-                    "convert-vector-to-scf",
-                    options='full-unroll')
-                    
-                l = transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    s.result,
-                    "convert-linalg-to-loops",
-                )
-                    
+                   
                 fp = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
-                    l.result,
+                    sequence.bodyTarget,
                     "arith-emulate-unsupported-floats",
                     options='source-types=f8E5M2,f8E4M3FN,bf16 target-type=f32'
                 )
@@ -901,31 +792,12 @@ class CPUBackend(BaseBackend):
                     options='include-f8e5m2=true include-bf16=true include-f8e4m3fn=true'
                 )
  
-                sve = transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    fp2.result,
-                    "arm-sve-legalize-vector-storage",
-                )
-
-                vec = transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    sve.result,
-                    "convert-vector-to-llvm",
-                    options='enable-arm-sve',
-                )
-
                 poly = transform.ApplyRegisteredPassOp(
                     transform.OperationType.get("func.func"),
-                    vec.result,
+                    fp2.result,
                     "test-math-polynomial-approximation",
                 )
 
-                transform.ApplyRegisteredPassOp(
-                    transform.OperationType.get("func.func"),
-                    poly.result,
-                    "convert-math-to-llvm",
-                )
-                    
                 transform.YieldOp([])
 
         def transform_main():
@@ -938,13 +810,6 @@ class CPUBackend(BaseBackend):
                 
             with InsertionPoint(sequence.body):
                     
-                include = transform.IncludeOp(
-                    [],
-                    FlatSymbolRefAttr.get("main_type1_pad"),
-                    transform.FailurePropagationMode.Propagate,
-                    [sequence.bodyTarget],
-                )
-
                 include2 = transform.IncludeOp(
                     [],
                     FlatSymbolRefAttr.get("main_type1_contraction"),
@@ -965,13 +830,23 @@ class CPUBackend(BaseBackend):
                     transform.FailurePropagationMode.Propagate,
                     [sequence.bodyTarget],
                 )
-
+                
+                include_legalize = transform.IncludeOp(
+                    [],
+                    FlatSymbolRefAttr.get("main_type1_legalize"),
+                    transform.FailurePropagationMode.Propagate,
+                    [sequence.bodyTarget],
+                )
+                    
+                
+                '''
                 include5 = transform.IncludeOp(
                     [],
                     FlatSymbolRefAttr.get("main_type1_pipeline"),
                     transform.FailurePropagationMode.Propagate,
                     [sequence.bodyTarget],
                 )
+                '''
                 
                 include6 = transform.IncludeOp(
                     [],
@@ -979,6 +854,30 @@ class CPUBackend(BaseBackend):
                     transform.FailurePropagationMode.Propagate,
                     [sequence.bodyTarget],
                 )
+                
+                funcs = structured.MatchOp.match_op_names(
+                    transform.OperationType.get("func.func"),
+                    sequence.bodyTarget,
+                    ["func.func"]
+                )
+ 
+                ## for each
+                foreach = transform.ForeachOp(
+                    [],
+                    funcs,
+                )
+                    
+                foreachBody = foreach.body.blocks.append(transform.OperationType.get("func.func"))
+                    
+                with InsertionPoint(foreachBody):
+                    # passes for fp8
+                    transform.IncludeOp(
+                        [],
+                        FlatSymbolRefAttr.get("opt"),
+                        transform.FailurePropagationMode.Propagate,
+                        [foreachBody.arguments[0]],
+                    )
+                    transform.YieldOp([])
                 
                 include7 = transform.IncludeOp(
                     [],
@@ -995,17 +894,18 @@ class CPUBackend(BaseBackend):
             mod.operation.attributes["transform.with_named_sequence"] = UnitAttr.get()
             
             with InsertionPoint(mod.body):
-                ew_2d_tile_pad_schedule()
-                main_type1("ew_2d_tile_pad_schedule", "pad")
                 contraction_schedule()
                 main_type1("contraction_schedule", "contraction")
                 vectorize_schedule()
                 main_type1("vectorize_schedule", "vectorize")
                 bufferize_schedule()
                 main_bufferize()
+                legalize_schedule()
+                main_type1("legalize_schedule", "legalize")
                 pipeline_schedule()
                 main_type1("pipeline_schedule", "pipeline")
                 loops_schedule()
+                opt()
                 main_type2("loops_schedule", "loops")
                 lower_to_llvm_schedule()
                 main_type2("lower_to_llvm_schedule", "lower_to_llvm")
@@ -1310,7 +1210,6 @@ class CPUBackend(BaseBackend):
     def _ttsharedir_to_llir(self, ttsharedir: str):
         with tempfile.TemporaryDirectory() as tmpdir:
             ttshared_path = os.path.join(tmpdir, "ttshared.mlir")
-            transformed_path = os.path.join(tmpdir, "transformed.mlir") ## ttshared after applying the transform dialect
             llmlir_path = os.path.join(tmpdir, "ll.mlir")
             llir_path = os.path.join(tmpdir, "ll.ir")
             Path(ttshared_path).write_text(ttsharedir)
@@ -1319,17 +1218,26 @@ class CPUBackend(BaseBackend):
             context = ir.context()
             triton_shared.ir.load_dialects(context)
 
-            #pm.enable_debug()
+            '''
+            # Lower special tptr dialect
+            mod = ir.parse_mlir_module(ttshared_path, context)
+            pm = ir.pass_manager(context)
+            triton_shared.to_llir.add_convert_tptr_to_llvm(pm)
+            pm.run(mod)
+            Path(ttshared_path).write_text(str(mod))
+            '''
             
             if FORCE_SME or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
                 pipeline = [
                 "--transform-interpreter",
                 "--test-transform-dialect-erase-schedule",
+                "--strip-debuginfo",
                 ]
             elif FORCE_SVE or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
                 pipeline = [
                 "--transform-interpreter",
                 "--test-transform-dialect-erase-schedule",
+                "--strip-debuginfo",
                 ]
             else:
                 # TODO: Update this to use the transform dialect passes or else it wont work 
@@ -1345,13 +1253,9 @@ class CPUBackend(BaseBackend):
                 "--reconcile-unrealized-casts",
                 ]
            
-            subprocess.check_call([mlir_opt_path, ttshared_path] + pipeline + [ "-o", transformed_path])
+            subprocess.check_call([mlir_opt_path, ttshared_path] + pipeline + [ "-o", llmlir_path])
 
-            mod = ir.parse_mlir_module(transformed_path, context)
-            pm = ir.pass_manager(context)
-            triton_shared.to_llir.add_convert_tptr_to_llvm(pm)
-            pm.run(mod)
-            Path(llmlir_path).write_text(str(mod))
+
            
             # TritonShared-MLIR to LLVM-MLIR
             self._extract_mlir_function(llmlir_path)

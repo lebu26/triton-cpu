@@ -124,7 +124,7 @@ I removed those rewrites and made sure to use the `TypeConverter` I backported f
 
 ## Adding support for tt.atomic_rmw
 
-To add support to this operation I did a conversion pass in the file `ReconcilePtrCastsPass.cpp` that made the conversion from `tt.atomic_rmw` to `memref.atomic_rmw` I also needed to [backport some commits]() to fix a bug found in the `remove-dead-values` pass that was crashing the pipeline.
+To add support to this operation I did a conversion pass in the file `ReconcilePtrCastsPass.cpp` that made the conversion from `tt.atomic_rmw` to `memref.atomic_rmw` I also needed to [backport some commits](https://gitee.com/openeuler/llvm-project/pulls/269?source=dashboard) to fix a bug found in the `remove-dead-values` pass that was crashing the pipeline.
 
 for the tests called `test_atomic_rmw` the conversion was quite straight forward as those test only read-modify-write a single value. But, for the tests called `test_tensor_atomic_rmw` the conversion was harder as triton enables read-modify-write for whole tensors and that is not possible in MLIR so I took the same approach as before but adding a loop and some other conversion around the `memref.atomic_rmw` for it to iterate trough each element.
 
