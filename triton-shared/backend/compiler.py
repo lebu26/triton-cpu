@@ -223,17 +223,20 @@ class CPUBackend(BaseBackend):
                     funcs.result,
                 )
 
-                ## MISSING: hoist redundant vector casts
-
-                ## hoist redundant vector broadcasts
-                b = transform.structured.HoistRedundantVectorBroadcastsOp(
+                b = transform.structured.HoistRedundantVectorCastsOp(
                     transform.AnyOpType.get(),
                     a.result,
+                )
+
+                ## hoist redundant vector broadcasts
+                c = transform.structured.HoistRedundantVectorBroadcastsOp(
+                    transform.AnyOpType.get(),
+                    b.result,
                 )
                 ## canonicalize
                 transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
-                    b.result,
+                    c.result,
                     "canonicalize",
                 )
 
@@ -313,17 +316,20 @@ class CPUBackend(BaseBackend):
                     funcs.result,
                 )
 
-                ## MISSING: hoist redundant vector casts
-
-                ## hoist redundant vector broadcasts
-                b = transform.structured.HoistRedundantVectorBroadcastsOp(
+                b = transform.structured.HoistRedundantVectorCastsOp(
                     transform.AnyOpType.get(),
                     a.result,
+                )
+
+                ## hoist redundant vector broadcasts
+                c = transform.structured.HoistRedundantVectorBroadcastsOp(
+                    transform.AnyOpType.get(),
+                    b.result,
                 )
                 ## canonicalize
                 transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
-                    b.result,
+                    c.result,
                     "canonicalize",
                 )
 
@@ -538,24 +544,25 @@ class CPUBackend(BaseBackend):
                     funcs.result,
                 )
 
-                ## MISSING: hoist redundant vector casts
-
-                ## hoist redundant vector broadcasts
-                b = transform.structured.HoistRedundantVectorBroadcastsOp(
+                b = transform.structured.HoistRedundantVectorCastsOp(
                     transform.AnyOpType.get(),
                     a.result,
+                )
+
+                ## hoist redundant vector broadcasts
+                c = transform.structured.HoistRedundantVectorBroadcastsOp(
+                    transform.AnyOpType.get(),
+                    b.result,
                 )
                 ## canonicalize
                 transform.ApplyRegisteredPassOp(
                     transform.AnyOpType.get(),
-                    b.result,
+                    c.result,
                     "canonicalize",
                 )
 
                 transform.YieldOp([])
  
-
-        ## MISSING: legalize_schedule
 
         def legalize_schedule():
             sequence = transform.NamedSequenceOp(
