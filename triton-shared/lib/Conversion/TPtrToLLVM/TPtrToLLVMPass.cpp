@@ -131,16 +131,6 @@ public:
 
     target.addDynamicallyLegalOp<UnrealizedConversionCastOp>(
         [&](UnrealizedConversionCastOp op) {
-          for (auto type : op.getResultTypes()) {
-            if (isa<triton::PointerType, ptr::PtrType>(type)) {
-              return false;
-            }
-          }
-          for (auto operand : op.getOperands()) {
-            if (isa<triton::PointerType, ptr::PtrType>(operand.getType())) {
-              return false;
-            }
-          }
           return true;
         });
 

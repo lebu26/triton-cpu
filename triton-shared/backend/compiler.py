@@ -622,7 +622,7 @@ class CPUBackend(BaseBackend):
                     pdl_seq4 = transform.SequenceOp(transform.FailurePropagationMode.Propagate, [], withPdl4.bodyTarget)
                     with InsertionPoint(pdl_seq4.body):
                         matched4 = transform_pdl.PDLMatchOp(pdl.OperationType.get(), pdl_seq4.bodyTarget, "isMicroKernel")
-                        #split0, split1 = transform.SplitHandleOp([pdl.OperationType.get(), pdl.OperationType.get()], matched4.result).results  # yields two handles
+                        split0, split1 = transform.SplitHandleOp([pdl.OperationType.get(), pdl.OperationType.get()], matched4.result).results  # yields two handles
                         cast_micro_for = transform.CastOp(transform.OperationType.get("scf.for"), matched4)
                         loop.LoopPipelineOp(
                             transform.OperationType.get("scf.for"),
@@ -737,42 +737,6 @@ class CPUBackend(BaseBackend):
                 transform.YieldOp([sequence.bodyTarget])
  
 
-           
-
-        ## Transform needed for SVE (as seen in the official MLIR example)
-        def tileAndVectorize():
-            sequence = transform.NamedSequenceOp(
-                "__tile_and_vectorize",
-                [transform.OperationType.get("func.func")],
-                [],
-                arg_attrs = [{"transform.readonly": UnitAttr.get()}],
-            )
-            with InsertionPoint(sequence.body):
-                # Step 0: Get a handle to the matmul op
-                matmuls = structured.MatchOp.match_op_names(
-                    sequence.bodyTarget,
-                    ["linalg.matmul"] 
-                )
-                    
-                # Step 1: Tile
-                tiled = structured.TileUsingForOp(matmuls.result, sizes=[2,[4],1])
-
-                # Step 2: Vectorize
-                structured.VectorizeOp(tiled.results[0], [2, [4], 1])
-                    
-                # Step 3: Lower vector.multi_reduction to vector.contract (+ some helpful patterns)
-                with InsertionPoint(transform.ApplyPatternsOp(sequence.bodyTarget).patterns):
-                    vector.ApplyVectorReductionToContractPatternsOp()
-                    vector.ApplyTransferPermutationPatternsOp()
-                    vector.ApplyLowerMaskedTransfersPatternsOp()
-                    # vector.ApplySinkVectorPatternsOp() # not available in LLVM 19
-
-                with InsertionPoint(transform.ApplyPatternsOp(sequence.bodyTarget).patterns):
-                    vector.ApplyLowerContractionPatternsOp(lowering_strategy=vector.VectorContractLowering.OuterProduct)
-                    vector.ApplyLowerOuterProductPatternsOp()
-                        
-                transform.YieldOp([])
-
         ## instead of using mlir-opt we embed the optimization passes in the transform dialect 
         def opt():
             sequence = transform.NamedSequenceOp(
@@ -803,6 +767,38 @@ class CPUBackend(BaseBackend):
                     transform.OperationType.get("func.func"),
                     fp2.result,
                     "test-math-polynomial-approximation",
+                )
+
+                p = transform.get_parent_op(
+                    transform.AnyOpType.get(),
+                    poly.result, 
+                    deduplicate=True,
+                )
+
+                tptr = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    p,
+                    "tptr-to-llvm",
+                )
+
+                
+                cann = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    tptr.result,
+                    "canonicalize",
+                )
+
+
+                fin = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    cann.result,
+                    "finalize-memref-to-llvm",
+                )
+
+                casts = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    fin.result,
+                    "reconcile-unrealized-casts",
                 )
 
                 transform.YieldOp([])
@@ -846,14 +842,12 @@ class CPUBackend(BaseBackend):
                 )
                     
                 
-                '''
                 include5 = transform.IncludeOp(
                     [],
                     FlatSymbolRefAttr.get("main_type1_pipeline"),
                     transform.FailurePropagationMode.Propagate,
                     [sequence.bodyTarget],
                 )
-                '''
                 
                 include6 = transform.IncludeOp(
                     [],
@@ -1096,6 +1090,71 @@ class CPUBackend(BaseBackend):
                 )
 
                 transform.YieldOp([])
+
+        def opt():
+            sequence = transform.NamedSequenceOp(
+                "opt",
+                [transform.OperationType.get("func.func")],
+                [],
+                arg_attrs = [{"transform.consumed": UnitAttr.get()}],
+            )
+
+            with InsertionPoint(sequence.body):
+
+                   
+                fp = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    sequence.bodyTarget,
+                    "arith-emulate-unsupported-floats",
+                    options='source-types=f8E5M2,f8E4M3FN,bf16 target-type=f32'
+                )
+
+                fp2 = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    fp.result,
+                    "arith-expand",
+                    options='include-f8e5m2=true include-bf16=true include-f8e4m3fn=true'
+                )
+ 
+                poly = transform.ApplyRegisteredPassOp(
+                    transform.OperationType.get("func.func"),
+                    fp2.result,
+                    "test-math-polynomial-approximation",
+                )
+
+                p = transform.get_parent_op(
+                    transform.AnyOpType.get(),
+                    poly.result, 
+                    deduplicate=True,
+                )
+
+                tptr = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    p,
+                    "tptr-to-llvm",
+                )
+
+                
+                cann = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    tptr.result,
+                    "canonicalize",
+                )
+
+
+                fin = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    cann.result,
+                    "finalize-memref-to-llvm",
+                )
+
+                casts = transform.ApplyRegisteredPassOp(
+                    transform.AnyOpType.get(),
+                    fin.result,
+                    "reconcile-unrealized-casts",
+                )
+
+                transform.YieldOp([])
         
         def transform_main():
             sequence = transform.NamedSequenceOp(
@@ -1120,6 +1179,30 @@ class CPUBackend(BaseBackend):
                     [first],
                 )
 
+                funcs = structured.MatchOp.match_op_names(
+                    transform.OperationType.get("func.func"),
+                    first,
+                    ["func.func"]
+                )
+ 
+                ## for each
+                foreach = transform.ForeachOp(
+                    [],
+                    funcs,
+                )
+                    
+                foreachBody = foreach.body.blocks.append(transform.OperationType.get("func.func"))
+                    
+                with InsertionPoint(foreachBody):
+                    # passes for fp8
+                    transform.IncludeOp(
+                        [],
+                        FlatSymbolRefAttr.get("opt"),
+                        transform.FailurePropagationMode.Propagate,
+                        [foreachBody.arguments[0]],
+                    )
+                    transform.YieldOp([])
+ 
                 ## include step 2 llvm
                 transform.IncludeOp(
                     [],
@@ -1141,6 +1224,7 @@ class CPUBackend(BaseBackend):
                 arm_sme_lowering_schedule()
                 lower_to_llvm()
                 step2(FlatSymbolRefAttr.get("__arm_sme_lowering_schedule"), "sme")
+                opt()
                 step2(FlatSymbolRefAttr.get("__lower_to_llvm"), "llvm")
                 transform_main()
 
@@ -1220,50 +1304,34 @@ class CPUBackend(BaseBackend):
             llmlir_path = os.path.join(tmpdir, "ll.mlir")
             llir_path = os.path.join(tmpdir, "ll.ir")
             Path(ttshared_path).write_text(ttsharedir)
-            mlir_opt_path = _get_llvm_bin_path("mlir-opt")
             _dump_ir_if_needed([ttshared_path])
             context = ir.context()
             triton_shared.ir.load_dialects(context)
-
-            '''
-            # Lower special tptr dialect
             mod = ir.parse_mlir_module(ttshared_path, context)
             pm = ir.pass_manager(context)
-            triton_shared.to_llir.add_convert_tptr_to_llvm(pm)
-            pm.run(mod)
-            Path(ttshared_path).write_text(str(mod))
-            '''
+            pm.enable_debug()
             
-            if FORCE_SME or (self.cpu_arch == "aarch64" and "sme" in self.cpu_features):
-                pipeline = [
-                "--transform-interpreter",
-                "--test-transform-dialect-erase-schedule",
-                "--strip-debuginfo",
-                ]
-            elif FORCE_SVE or (self.cpu_arch == "aarch64" and "sve" in self.cpu_features):
-                pipeline = [
-                "--transform-interpreter",
-                "--test-transform-dialect-erase-schedule",
-                "--strip-debuginfo",
-                ]
+            
+            if FORCE_SME or FORCE_SVE or (self.cpu_arch == "aarch64" and {"sme", "sve"} & set(self.cpu_features)):
+                triton_shared.to_llir.add_transform_interpreter(pm)
+                triton_shared.to_llir.add_test_transform_dialect_erase_schedule(pm)
+                triton_shared.to_llir.add_convert_to_llvm(pm)
+                triton_shared.to_llir.add_canonicalizer(pm)
+                triton_shared.to_llir.add_strip_debug_info(pm)
             else:
-                # TODO: Update this to use the transform dialect passes or else it wont work 
-                pipeline = [
-                "--convert-linalg-to-affine-loops",
-                "--empty-tensor-to-alloc-tensor",
-                "--one-shot-bufferize=allow-return-allocs-from-loops=true",
-                "--lower-affine",
-                "--convert-linalg-to-loops",
-                "--expand-strided-metadata",
-                "--convert-scf-to-cf",
-                "--test-lower-to-llvm",
-                "--reconcile-unrealized-casts",
-                ]
-           
-            subprocess.check_call([mlir_opt_path, ttshared_path] + pipeline + [ "-o", llmlir_path])
+                triton_shared.to_llir.add_convert_linalg_to_affine_loops(pm)
+                triton_shared.to_llir.add_empty_tensor_to_alloc_tensor(pm)
+                triton_shared.to_llir.add_one_shot_bufferize(pm)
+                triton_shared.to_llir.add_lower_affine(pm)
+                triton_shared.to_llir.add_convert_linalg_to_loops(pm)
+                triton_shared.to_llir.add_expand_strided_metadata(pm)
+                triton_shared.to_llir.add_convert_scf_to_cf(pm)
+                triton_shared.to_llir.add_convert_to_llvm(pm)
+                triton_shared.to_llir.add_strip_debug_info(pm)
 
+            pm.run(mod)
+            Path(llmlir_path).write_text(str(mod))
 
-           
             # TritonShared-MLIR to LLVM-MLIR
             self._extract_mlir_function(llmlir_path)
             _dump_ir_if_needed([llmlir_path])
