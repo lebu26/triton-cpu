@@ -63,7 +63,7 @@ SVE has a bug even on upstream LLVM where if the matrix is too big it will crash
 
 ## Running on SME
 
-Compiling to object code required a patch in llvm provided by Chenzheng.
+Compiling to object code required a patch in llvm provided by Chenzheng (already merged).
 
 ## Passing test on SVE
 
@@ -84,7 +84,7 @@ With the help of upstream, see [this issue](https://github.com/llvm/llvm-project
 
 ## Adding support for fp8e4m3
 
-Sames as with fp8e5m2 again using [this other blog post](https://www.xyzzhangfan.tech/blog/2025/Convert_fp32_and_fp8_e4m3/) altought, this time the test are giving me an acurracy error, the algorithm is right but we can expect much precision from this datatype so I lowered the expected error on the tests.
+Sames as with fp8e5m2 again using [this other blog post](https://www.xyzzhangfan.tech/blog/2025/Convert_fp32_and_fp8_e4m3/) although, this time the test are giving me an accuracy error, the algorithm is right but we can expect much precision from this datatype so I lowered the expected error on the tests.
 
 ## Adding support for more complex reduction operations
 
@@ -92,7 +92,7 @@ Triton-shared does not support reduce operations that have more than one op in t
 
 ## Addding support for the scan operation
 
-The scan operation performs a cumulative reduction, simply that means a reduction but storing all of the intermiediate results, for instance a scan operation with just and add operation in it's body is just a [cumsum](https://numpy.org/devdocs/reference/generated/numpy.cumsum.html). 
+The scan operation performs a cumulative reduction, simply that means a reduction but storing all of the intermediate results, for instance a scan operation with just and add operation in it's body is just a [cumsum](https://numpy.org/devdocs/reference/generated/numpy.cumsum.html). 
 
 As there is no such operation in standard MLIR (though there is in other projects like IREE) it's not possible to just translate it to a high level equivalent operation. Because of that, the best solution I found was just to lower it to loops directly.
 
@@ -107,9 +107,9 @@ At a conceptual level, this implementation works as follows:
 
 This triton-shared bug is partially fixed in the lastest version as discussed in [this issue](https://github.com/microsoft/triton-shared/issues/311). The code gets lowered to `tptr` and `ptr` dialect however the is not a lowering to LLVM just yet.
 
-To get as close as upstream triton-shared as I could I started looking at the commits and making changes. At the start I tought I would only need commits related to `tptr` but I later tought that including the other could be a good idea too (that's why in my commit history it does not match with the origianl order of triton-shared). In the end I just ended up skipping commits related to triton updates or related to other pieces of code I had already changed myself (like reduction) and made the necessary changes for it to work with the MLIR 19 API.
+To get as close as upstream triton-shared as I could I started looking at the commits and making changes. At the start I tought I would only need commits related to `tptr` but I later tought that including the other could be a good idea too (that's why in my commit history it does not match with the original order of triton-shared). In the end I just ended up skipping commits related to triton updates or related to other pieces of code I had already changed myself (like reduction) and made the necessary changes for it to work with the MLIR 19 API.
 
-However, I found a bug where all of my code was getting deleted, after degugging I found the solution in [this upstream commit](https://github.com/llvm/llvm-project/commit/df0d249b6511289f1e8c1389f4fd33d7b4c083fa) so I made [this backport](https://gitee.com/openeuler/llvm-project/pulls/255) to the open euler llvm.
+However, I found a bug where all of my code was getting deleted, after debugging I found the solution in [this upstream commit](https://github.com/llvm/llvm-project/commit/df0d249b6511289f1e8c1389f4fd33d7b4c083fa) so I made [this backport](https://gitee.com/openeuler/llvm-project/pulls/255) to the open euler llvm.
 
 
 Now I used the code in [this PR](https://github.com/microsoft/triton-shared/pull/325) that lower `tptr` to llvm as the `ptr` dialect in MLIR is not developed enough even in upstream. However, adding a `lower-to-llvm` pass to triton-shared implies that we need to start using `triton-shared-opt` instead of `mlir-opt` in the middle of the pipeline as now we are mixing standard MLIR + `tptr` in this situation.
@@ -132,3 +132,12 @@ for the tests called `test_atomic_rmw` the conversion was quite straight forward
 ## Adding support for tt.dot with 3d tensors
 
 To add support to this operation I just checked the rank of the tensors in the `MatmulConverter` in `ConversionPatterns.hpp` and if it's 3d the it replaces the op for a `linalg.batch_matmul` instead of a normal matmul.
+
+## Why use the TPtr dialect
+
+Related to the part of [fixing tt.storeOp cannot be rewritten](#fixing-ttstoreOp-cannot-be-rewritten) we are using the TPtr dialect and some additions from a PR that was actually **rejected** which may seem a little off. However we need this for two reason.
+
+* There is still to this day (25-09-2025) no way to lower TPtr outside of that PR
+* The plan of the triton-shared devs is to lower TPtr to mlir ptr dialect but that is introduced on llvm22 and backporting that to llvm19 is not feasible at all (believe me, I've tried) 
+
+Having to use TPtr like this may be a bit of a burden as we need to use the `tptr-to-llvm` pass in the middle of the pipeline but is the only practical way to be able to lower some pieces of code.
