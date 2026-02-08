@@ -177,13 +177,13 @@ class CPUBackend(BaseBackend):
             triton_shared_opt_path = _get_triton_shared_opt_path()
             try:
                 subprocess.check_call([triton_shared_opt_path, src_path, "--triton-to-linalg-experimental", "-o", dst_path])
-                return Path(dst_path).read_text()
             except subprocess.CalledProcessError as e:
                 if ENABLE_FALLBACK:
                     print("TritonShared-MLIR optimization failed, falling back to CPU backend")
                     os.environ["TRITON_USE_SHARED_BACKEND"] = "0"
                     raise CPUFallbackException
-            
+                stderr = getattr(e, "stderr", "")
+                raise RuntimeError(f"TritonShared-MLIR optimization failed: {e}. Stderr: {stderr}") from e
             return Path(dst_path).read_text()
 
 
