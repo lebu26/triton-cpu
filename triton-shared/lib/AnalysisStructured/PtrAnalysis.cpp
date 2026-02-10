@@ -1591,6 +1591,7 @@ LogicalResult PtrAnalysis::rewriteLoadOp(triton::LoadOp op,
   }
 
   ArrayRef<OpFoldResult> dims;
+  SmallVector<OpFoldResult> boundaryDims;
   mlir::triton::MaskState mstate(useUnsafeMask);
   Value scalarOther;
 
@@ -1605,6 +1606,36 @@ LogicalResult PtrAnalysis::rewriteLoadOp(triton::LoadOp op,
     dims = mstate.dims;
   }
 
+  // Handle boundary checks for block pointer loads.
+  // When a block pointer load has boundaryCheck, we need to compute mask dims
+  // to prevent out-of-bounds memory access. For each checked dimension:
+  //   mask_dim = max(0, min(block_size, tensor_shape - offset))
+  auto boundaryChecks = op.getBoundaryCheck();
+  if (!boundaryChecks.empty() && dims.empty()) {
+    if (auto makeTensorPtrOp = ptr.getDefiningOp<tts::MakeTensorPtrOp>()) {
+      auto sizes = makeTensorPtrOp.getSizes();
+      auto mixedOffsets = makeTensorPtrOp.getMixedOffsets();
+      auto mixedShape = makeTensorPtrOp.getMixedShape();
+
+      for (int64_t i = 0; i < static_cast<int64_t>(sizes.size()); i++) {
+        OpFoldResult blockSize = builder.getIndexAttr(sizes[i]);
+        if (llvm::is_contained(boundaryChecks, static_cast<int32_t>(i))) {
+          // Compute: max(0, min(block_size, shape[i] - offset[i]))
+          OpFoldResult remaining =
+              subOFRs(mixedShape[i], mixedOffsets[i], loc, builder);
+          OpFoldResult clampedSize =
+              minOFRs(blockSize, remaining, loc, builder);
+          OpFoldResult zero = builder.getIndexAttr(0);
+          clampedSize = maxOFRs(clampedSize, zero, loc, builder);
+          boundaryDims.push_back(clampedSize);
+        } else {
+          boundaryDims.push_back(blockSize);
+        }
+      }
+      dims = boundaryDims;
+    }
+  }
+
   if (other) {
     assert(mask && "other value used while no masks are specified");
 
@@ -1614,6 +1645,12 @@ LogicalResult PtrAnalysis::rewriteLoadOp(triton::LoadOp op,
                      "unsupported instruction");
       return failure();
     }
+  } else if (!boundaryChecks.empty() && !dims.empty()) {
+    // Block pointer loads with boundary check need zero padding for
+    // out-of-bounds elements.
+    auto tensorTy = cast<RankedTensorType>(op.getType());
+    scalarOther = builder.create<arith::ConstantOp>(
+        loc, builder.getZeroAttr(tensorTy.getElementType()));
   }
 
   auto loadOp = builder.create<tts::LoadOp>(loc, ptr, dims, scalarOther);
@@ -1726,6 +1763,7 @@ LogicalResult PtrAnalysis::rewriteStoreOp(triton::StoreOp op,
   }
 
   ArrayRef<OpFoldResult> dims;
+  SmallVector<OpFoldResult> boundaryDims;
   mlir::triton::MaskState mstate(useUnsafeMask);
 
   OpBuilder builder(op);
@@ -1738,6 +1776,33 @@ LogicalResult PtrAnalysis::rewriteStoreOp(triton::StoreOp op,
       return failure();
     }
     dims = mstate.dims;
+  }
+
+  // Handle boundary checks for block pointer stores.
+  // Same logic as rewriteLoadOp: compute mask dims from block pointer metadata.
+  auto boundaryChecks = op.getBoundaryCheck();
+  if (!boundaryChecks.empty() && dims.empty()) {
+    if (auto makeTensorPtrOp = ptr.getDefiningOp<tts::MakeTensorPtrOp>()) {
+      auto sizes = makeTensorPtrOp.getSizes();
+      auto mixedOffsets = makeTensorPtrOp.getMixedOffsets();
+      auto mixedShape = makeTensorPtrOp.getMixedShape();
+
+      for (int64_t i = 0; i < static_cast<int64_t>(sizes.size()); i++) {
+        OpFoldResult blockSize = builder.getIndexAttr(sizes[i]);
+        if (llvm::is_contained(boundaryChecks, static_cast<int32_t>(i))) {
+          OpFoldResult remaining =
+              subOFRs(mixedShape[i], mixedOffsets[i], loc, builder);
+          OpFoldResult clampedSize =
+              minOFRs(blockSize, remaining, loc, builder);
+          OpFoldResult zero = builder.getIndexAttr(0);
+          clampedSize = maxOFRs(clampedSize, zero, loc, builder);
+          boundaryDims.push_back(clampedSize);
+        } else {
+          boundaryDims.push_back(blockSize);
+        }
+      }
+      dims = boundaryDims;
+    }
   }
 
   auto storeOp = builder.create<tts::StoreOp>(loc, ptr, val, dims);
